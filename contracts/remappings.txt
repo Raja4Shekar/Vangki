@@ -1,0 +1,3 @@
+@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/
+@diamond-3/=lib/diamond-3-hardhat/contracts/
+@chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/
