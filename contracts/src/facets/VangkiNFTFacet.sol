@@ -255,32 +255,3 @@ contract VangkiNFTFacet is ERC721("VangkiNFT", "VNGK") {
             statusHash == keccak256(bytes("Loan Defaulted"));
     }
 }
-// ##EOF##
-// pragma solidity ^0.8.29;
-
-// import {LibVangki} from "../libraries/LibVangki.sol";
-// import "@openzeppelin/contracts/token/ERC721/ERC721.sol"; // Extend for VangkiNFT
-
-// contract NFTFacet is ERC721("VangkiNFT", "VNGK") {
-//     // Storage for metadata/status (on-chain or IPFS)
-//     mapping(uint256 => string) private _tokenURIs;
-
-//     function mintNFT(
-//         address to,
-//         uint256 tokenId,
-//         string memory _tokenURI
-//     ) external {
-//         // Only callable by Diamond (internal)
-//         _mint(to, tokenId);
-//         _tokenURIs[tokenId] = _tokenURI; // Dynamic JSON
-//     }
-
-//     function tokenURI(
-//         uint256 tokenId
-//     ) public view override returns (string memory) {
-//         // Generate dynamic JSON with status, image IPFS based on role/status
-//         return _tokenURIs[tokenId]; // Expand to base64 JSON
-//     }
-
-//     // Update status function
-// }
