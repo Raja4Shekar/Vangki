@@ -655,4 +655,14 @@ The Diamond Standard (EIP-2535) need to be followed for smart contract developem
 
 # Special Note
 
-Note: The offers from users will be listed to only those users who are in the respective countries that can trade between themselves. This is done as there can be sactions between the countries.
+## Security Note:
+
+- The offers from users will be listed to only those users who are in the respective countries that can trade between themselves. This is done as there can be sactions between the countries.
+- No common escrow account and only seperate Escrow account for each users (via clone factory for gas efficiency) would implemented which will then be managed by Vangki App. This is to avoid commingling of funds.
+- Use Reentrancygaurd and pausable from Openzeppelin wherever needed.
+
+## Other Notes:
+
+- Keep cross chain functionality, governance, partial loan, flexible interest and multi collateral asset for later development (for phase 2) and complete other features first.
+- Follow the coding standards, style conventions and develop code by following best practices approach and with proper nat comments
+- Use Foundry for testing/fuzzing. Slither/Mythril for audits. Optimize: Batch claims, minimal storage.
