@@ -652,3 +652,7 @@ For utmost clarity:
 ## Developement Approach
 
 The Diamond Standard (EIP-2535) need to be followed for smart contract developement
+
+# Special Note
+
+Note: The offers from users will be listed to only those users who are in the respective countries that can trade between themselves. This is done as there can be sactions between the countries.
