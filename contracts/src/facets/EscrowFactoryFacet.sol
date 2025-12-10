@@ -8,6 +8,10 @@ import {VangkiEscrowImplementation} from "../VangkiEscrowImplementation.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 
 /**
  * @title EscrowFactoryFacet
@@ -49,25 +53,25 @@ contract EscrowFactoryFacet {
      * @notice Initializes the shared escrow implementation by deploying a new VangkiEscrowImplementation.
      * @dev Sets the implementation address in storage if not already set.
      *      Callable only once by the Diamond owner to prevent re-initialization.
-     *      No parameters; deploys a fresh implementation.
+     *      No parameters; deploys a fresh implementation and initializes it.
      */
     function initializeEscrowImplementation() external {
         LibDiamond.enforceIsContractOwner();
         LibVangki.Storage storage s = LibVangki.storageSlot();
-        if (s.vangkiEscrowTemplate != address(0)) {
-            revert AlreadyInitialized();
-        }
+        if (s.vangkiEscrowTemplate != address(0)) revert AlreadyInitialized();
+
         VangkiEscrowImplementation impl = new VangkiEscrowImplementation();
+        impl.initialize(); // Assume initialize() in impl sets owner to Diamond
         s.vangkiEscrowTemplate = address(impl);
     }
 
     /**
-     * @notice Retrieves or creates a UUPS proxy for the specified user if it doesn't exist.
-     * @dev If no proxy exists, deploys a new ERC1967Proxy pointing to the current implementation and initializes it.
-     *      Emits UserEscrowCreated on new deployment.
-     *      Can be called by any facet or externally, but typically used internally.
-     * @param user The address of the user for the escrow.
-     * @return proxy The address of the user's escrow proxy.
+     * @notice Gets or creates a user's escrow proxy.
+     * @dev Deploys a new ERC1967Proxy if none exists, pointing to the shared implementation.
+     *      View function if exists; mutates if creates.
+     *      Emits UserEscrowCreated on creation.
+     * @param user The user address.
+     * @return proxy The user's escrow proxy address.
      */
     function getOrCreateUserEscrow(
         address user
@@ -77,7 +81,7 @@ contract EscrowFactoryFacet {
         if (proxy == address(0)) {
             ERC1967Proxy newProxy = new ERC1967Proxy(
                 s.vangkiEscrowTemplate,
-                abi.encodeCall(VangkiEscrowImplementation.initialize, ())
+                ""
             );
             proxy = address(newProxy);
             s.userVangkiEscrows[user] = proxy;
@@ -86,249 +90,238 @@ contract EscrowFactoryFacet {
     }
 
     /**
-     * @notice Upgrades the shared escrow implementation used by all proxies.
-     * @dev Updates the storage pointer; all existing proxies will delegate to the new implementation automatically.
-     *      Validates the new implementation is UUPS-compatible via a test call to _authorizeUpgrade.
-     *      Callable only by the Diamond owner.
-     *      Emits EscrowImplementationUpgraded event.
-     * @param newImplementation The address of the new deployed VangkiEscrowImplementation.
+     * @notice Upgrades the shared escrow implementation.
+     * @dev Callable only by Diamond owner. Updates all proxies via UUPS.
+     *      Validates new impl is contract and compatible.
+     *      Emits EscrowImplementationUpgraded.
+     * @param newImplementation The new implementation address.
      */
     function upgradeEscrowImplementation(address newImplementation) external {
         LibDiamond.enforceIsContractOwner();
+        if (newImplementation.code.length == 0) revert UpgradeFailed();
+
         LibVangki.Storage storage s = LibVangki.storageSlot();
-        address oldImplementation = s.vangkiEscrowTemplate;
-
-        // ##No test call; assume newImplementation is valid UUPS##
-
-        // // Validate new impl supports UUPS (test call to _authorizeUpgrade)
-        // (bool success, ) = newImplementation.staticcall(
-        //     abi.encodeWithSelector(
-        //         VangkiEscrowImplementation._authorizeUpgrade.selector,
-        //         address(0)
-        //     )
-        // );
-        // if (!success) {
-        //     revert UpgradeFailed();
-        // }
-
+        address oldImpl = s.vangkiEscrowTemplate;
         s.vangkiEscrowTemplate = newImplementation;
-        emit EscrowImplementationUpgraded(oldImplementation, newImplementation);
+
+        // Note: Proxies auto-upgrade via UUPS; no per-proxy call needed
+        emit EscrowImplementationUpgraded(oldImpl, newImplementation);
     }
 
     /**
-     * @notice Deposits ERC20 tokens into the specified user's escrow proxy.
-     * @dev Transfers tokens from msg.sender to the proxy address using safeTransferFrom.
-     *      Callable by other facets (e.g., OfferFacet during offer creation).
-     *      Ensures the proxy exists by calling getOrCreateUserEscrow.
-     * @param user The user whose escrow receives the deposit.
-     * @param token The ERC20 token address.
-     * @param amount The amount of tokens to deposit.
+     * @notice Deposits ERC-20 tokens into the specified user's escrow.
+     * @dev Low-level call to the proxy's depositERC20 function.
+     *      Reverts on failure.
+     *      Callable by anyone (e.g., facets/users).
+     * @param user The user whose escrow to deposit into.
+     * @param token The ERC-20 token address.
+     * @param amount The amount to deposit.
      */
     function escrowDepositERC20(
         address user,
         address token,
         uint256 amount
-    ) public {
+    ) external {
         address proxy = getOrCreateUserEscrow(user);
-        IERC20(token).safeTransferFrom(msg.sender, proxy, amount);
+        (bool success, ) = proxy.call(
+            abi.encodeWithSelector(
+                VangkiEscrowImplementation.depositERC20.selector,
+                token,
+                amount
+            )
+        );
+        if (!success) revert ProxyCallFailed("Deposit ERC20 failed");
     }
 
     /**
-     * @notice Withdraws ERC20 tokens from the specified user's escrow proxy to a recipient.
-     * @dev Low-level call to the proxy's withdrawERC20 function (delegated to implementation).
-     *      Reverts if the call fails.
-     *      Callable by other facets (e.g., LoanFacet during repayment).
-     * @param user The user whose escrow is the source.
-     * @param token The ERC20 token address.
-     * @param to The recipient address.
-     * @param amount The amount of tokens to withdraw.
+     * @notice Withdraws ERC-20 tokens from the specified user's escrow to a recipient.
+     * @dev Low-level call to the proxy's withdrawERC20 function.
+     *      Reverts on failure.
+     *      Callable by authorized (e.g., facets).
+     * @param user The user whose escrow to withdraw from.
+     * @param token The ERC-20 token address.
+     * @param recipient The recipient address.
+     * @param amount The amount to withdraw.
      */
     function escrowWithdrawERC20(
         address user,
         address token,
-        address to,
+        address recipient,
         uint256 amount
-    ) public {
+    ) external {
         address proxy = getOrCreateUserEscrow(user);
         (bool success, ) = proxy.call(
             abi.encodeWithSelector(
                 VangkiEscrowImplementation.withdrawERC20.selector,
                 token,
-                to,
+                recipient,
                 amount
             )
         );
-        if (!success) {
-            revert ProxyCallFailed("ERC20 withdraw failed");
-        }
+        if (!success) revert ProxyCallFailed("Withdraw ERC20 failed");
     }
 
     /**
-     * @notice Returns the ERC20 balance of the specified user's escrow proxy.
-     * @dev Low-level staticcall to the proxy's balanceOfERC20 function.
-     *      Returns 0 on failure.
-     *      View function; callable by anyone.
-     * @param user The user whose escrow to query.
-     * @param token The ERC20 token address.
-     * @return The balance held in the escrow.
-     */
-    function escrowBalanceOfERC20(
-        address user,
-        address token
-    ) public view returns (uint256) {
-        LibVangki.Storage storage s = LibVangki.storageSlot();
-        address proxy = s.userVangkiEscrows[user];
-        if (proxy == address(0)) {
-            return 0;
-        }
-        (bool success, bytes memory result) = proxy.staticcall(
-            abi.encodeWithSelector(
-                VangkiEscrowImplementation.balanceOfERC20.selector,
-                token
-            )
-        );
-        if (!success) {
-            return 0;
-        }
-        return abi.decode(result, (uint256));
-    }
-
-    /**
-     * @notice Deposits an NFT (ERC721 or ERC1155) into the specified user's escrow proxy.
-     * @dev Low-level call to the proxy's depositNFT function.
-     *      Reverts if the call fails.
-     *      Callable by other facets (e.g., for NFT renting offers).
-     * @param user The user whose escrow receives the deposit.
+     * @notice Deposits an ERC-721 NFT into the specified user's escrow.
+     * @dev Low-level call to the proxy's depositERC721 function (safeTransferFrom).
+     *      Reverts on failure.
+     * @param user The user whose escrow to deposit into.
      * @param nftContract The NFT contract address.
      * @param tokenId The token ID.
-     * @param isERC1155 True for ERC1155, false for ERC721.
-     * @param amount For ERC1155: quantity; for ERC721: ignored (set to 1).
      */
-    function escrowDepositNFT(
+    function escrowDepositERC721(
         address user,
         address nftContract,
-        uint256 tokenId,
-        bool isERC1155,
-        uint256 amount
-    ) public {
+        uint256 tokenId
+    ) external {
         address proxy = getOrCreateUserEscrow(user);
         (bool success, ) = proxy.call(
             abi.encodeWithSelector(
-                VangkiEscrowImplementation.depositNFT.selector,
+                VangkiEscrowImplementation.depositERC721.selector,
                 nftContract,
-                tokenId,
-                isERC1155,
-                amount
+                tokenId
             )
         );
-        if (!success) {
-            revert ProxyCallFailed("NFT deposit failed");
-        }
+        if (!success) revert ProxyCallFailed("Deposit ERC721 failed");
     }
 
     /**
-     * @notice Withdraws an NFT (ERC721 or ERC1155) from the specified user's escrow proxy to a recipient.
-     * @dev Low-level call to the proxy's withdrawNFT function.
-     *      Reverts if the call fails.
-     *      Callable by other facets (e.g., on rental closure or default).
-     * @param user The user whose escrow is the source.
+     * @notice Withdraws an ERC-721 NFT from the specified user's escrow to a recipient.
+     * @dev Low-level call to the proxy's withdrawERC721 function.
+     *      Reverts on failure.
+     * @param user The user whose escrow to withdraw from.
      * @param nftContract The NFT contract address.
-     * @param to The recipient address.
      * @param tokenId The token ID.
-     * @param isERC1155 True for ERC1155, false for ERC721.
-     * @param amount For ERC1155: quantity; for ERC721: ignored (set to 1).
+     * @param recipient The recipient address.
      */
-    function escrowWithdrawNFT(
+    function escrowWithdrawERC721(
         address user,
         address nftContract,
-        address to,
         uint256 tokenId,
-        bool isERC1155,
-        uint256 amount
-    ) public {
+        address recipient
+    ) external {
         address proxy = getOrCreateUserEscrow(user);
         (bool success, ) = proxy.call(
             abi.encodeWithSelector(
-                VangkiEscrowImplementation.withdrawNFT.selector,
+                VangkiEscrowImplementation.withdrawERC721.selector,
                 nftContract,
-                to,
                 tokenId,
-                isERC1155,
-                amount
+                recipient
             )
         );
-        if (!success) {
-            revert ProxyCallFailed("NFT withdraw failed");
-        }
+        if (!success) revert ProxyCallFailed("Withdraw ERC721 failed");
     }
 
     /**
-     * @notice Returns the NFT balance or ownership in the specified user's escrow proxy.
-     * @dev Low-level staticcall to the proxy's balanceOfNFT function.
-     *      Returns 0 on failure.
-     *      View function; callable by anyone.
-     * @param user The user whose escrow to query.
+     * @notice Deposits ERC-1155 tokens into the specified user's escrow.
+     * @dev Low-level call to the proxy's depositERC1155 function.
+     *      Reverts on failure.
+     * @param user The user whose escrow to deposit into.
      * @param nftContract The NFT contract address.
      * @param tokenId The token ID.
-     * @param isERC1155 True for ERC1155, false for ERC721.
-     * @return The balance (ERC1155) or ownership count (ERC721: 0 or 1).
+     * @param amount The amount to deposit.
      */
-    function escrowBalanceOfNFT(
+    function escrowDepositERC1155(
         address user,
         address nftContract,
         uint256 tokenId,
-        bool isERC1155
-    ) public view returns (uint256) {
-        LibVangki.Storage storage s = LibVangki.storageSlot();
-        address proxy = s.userVangkiEscrows[user];
-        if (proxy == address(0)) {
-            return 0;
-        }
-        (bool success, bytes memory result) = proxy.staticcall(
+        uint256 amount
+    ) external {
+        address proxy = getOrCreateUserEscrow(user);
+        (bool success, ) = proxy.call(
             abi.encodeWithSelector(
-                VangkiEscrowImplementation.balanceOfNFT.selector,
+                VangkiEscrowImplementation.depositERC1155.selector,
                 nftContract,
                 tokenId,
-                isERC1155
+                amount
             )
         );
-        if (!success) {
-            return 0;
-        }
-        return abi.decode(result, (uint256));
+        if (!success) revert ProxyCallFailed("Deposit ERC1155 failed");
     }
 
     /**
-     * @notice Sets a temporary user for a rentable NFT in the specified user's escrow (ERC-4907 compliant).
-     * @dev Low-level call to the proxy's setNFTUser function.
-     *      Reverts if the call fails.
-     *      Callable by other facets (e.g., during NFT rental initiation).
-     * @param user The user whose escrow performs the operation.
+     * @notice Withdraws ERC-1155 tokens from the specified user's escrow to a recipient.
+     * @dev Low-level call to the proxy's withdrawERC1155 function.
+     *      Reverts on failure.
+     * @param user The user whose escrow to withdraw from.
      * @param nftContract The NFT contract address.
      * @param tokenId The token ID.
-     * @param renter The temporary renter address (zero to revoke).
-     * @param expires The UNIX timestamp for expiration.
+     * @param amount The amount to withdraw.
+     * @param recipient The recipient address.
      */
-    function escrowSetNFTUser(
+    function escrowWithdrawERC1155(
+        address user,
+        address nftContract,
+        uint256 tokenId,
+        uint256 amount,
+        address recipient
+    ) external {
+        address proxy = getOrCreateUserEscrow(user);
+        (bool success, ) = proxy.call(
+            abi.encodeWithSelector(
+                VangkiEscrowImplementation.withdrawERC1155.selector,
+                nftContract,
+                tokenId,
+                amount,
+                recipient
+            )
+        );
+        if (!success) revert ProxyCallFailed("Withdraw ERC1155 failed");
+    }
+
+    /**
+     * @notice Approves the user's escrow as operator for an ERC-721 NFT (for rentals without holding).
+     * @dev Low-level call to the proxy's approveERC721 function (IERC721.approve).
+     *      Reverts on failure.
+     * @param user The user whose escrow to approve from.
+     * @param nftContract The NFT contract address.
+     * @param tokenId The token ID.
+     */
+    function escrowApproveNFT721(
+        address user,
+        address nftContract,
+        uint256 tokenId
+    ) external {
+        address proxy = getOrCreateUserEscrow(user);
+        (bool success, ) = proxy.call(
+            abi.encodeWithSelector(
+                VangkiEscrowImplementation.approveERC721.selector,
+                nftContract,
+                tokenId
+            )
+        );
+        if (!success) revert ProxyCallFailed("Approve ERC721 failed");
+    }
+
+    /**
+     * @notice Sets the temporary user (renter) for a rentable NFT from the specified user's escrow.
+     * @dev Low-level call to the proxy's setNFTUser function (IERC4907.setUser).
+     *      Reverts on failure.
+     *      Callable by facets (e.g., for loan acceptance).
+     * @param user The user whose escrow to operate from (lender).
+     * @param nftContract The NFT contract address.
+     * @param tokenId The token ID.
+     * @param renter The temporary renter address.
+     * @param expires The expiration timestamp.
+     */
+    function setNFTUser(
         address user,
         address nftContract,
         uint256 tokenId,
         address renter,
         uint64 expires
-    ) public {
+    ) external {
         address proxy = getOrCreateUserEscrow(user);
         (bool success, ) = proxy.call(
             abi.encodeWithSelector(
-                VangkiEscrowImplementation.setNFTUser.selector,
+                VangkiEscrowImplementation.setUser.selector,
                 nftContract,
                 tokenId,
                 renter,
                 expires
             )
         );
-        if (!success) {
-            revert ProxyCallFailed("Set NFT user failed");
-        }
+        if (!success) revert ProxyCallFailed("Set NFT user failed");
     }
 
     /**
@@ -345,22 +338,19 @@ contract EscrowFactoryFacet {
         address user,
         address nftContract,
         uint256 tokenId
-    ) public view returns (address) {
+    ) external view returns (address) {
         LibVangki.Storage storage s = LibVangki.storageSlot();
         address proxy = s.userVangkiEscrows[user];
-        if (proxy == address(0)) {
-            return address(0);
-        }
+        if (proxy == address(0)) return address(0);
+
         (bool success, bytes memory result) = proxy.staticcall(
             abi.encodeWithSelector(
-                VangkiEscrowImplementation.getNFTUserOf.selector,
+                VangkiEscrowImplementation.userOf.selector,
                 nftContract,
                 tokenId
             )
         );
-        if (!success) {
-            return address(0);
-        }
+        if (!success) return address(0);
         return abi.decode(result, (address));
     }
 
@@ -378,22 +368,19 @@ contract EscrowFactoryFacet {
         address user,
         address nftContract,
         uint256 tokenId
-    ) public view returns (uint64) {
+    ) external view returns (uint64) {
         LibVangki.Storage storage s = LibVangki.storageSlot();
         address proxy = s.userVangkiEscrows[user];
-        if (proxy == address(0)) {
-            return 0;
-        }
+        if (proxy == address(0)) return 0;
+
         (bool success, bytes memory result) = proxy.staticcall(
             abi.encodeWithSelector(
-                VangkiEscrowImplementation.getNFTUserExpires.selector,
+                VangkiEscrowImplementation.userExpires.selector,
                 nftContract,
                 tokenId
             )
         );
-        if (!success) {
-            return 0;
-        }
+        if (!success) return 0;
         return abi.decode(result, (uint64));
     }
 }

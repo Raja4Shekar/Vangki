@@ -7,6 +7,7 @@ import {LibDiamond} from "@diamond-3/libraries/LibDiamond.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
 import {OracleFacet} from "./OracleFacet.sol"; // For selector
 import {VangkiNFTFacet} from "./VangkiNFTFacet.sol"; // For selector
 import {EscrowFactoryFacet} from "./EscrowFactoryFacet.sol"; // For escrow selectors
@@ -25,6 +26,7 @@ import {EscrowFactoryFacet} from "./EscrowFactoryFacet.sol"; // For escrow selec
  */
 contract OfferFacet is ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using Strings for uint256;
 
     /// @notice Emitted when a new offer is created.
     /// @param offerId The unique ID of the created offer.
@@ -54,32 +56,38 @@ contract OfferFacet is ReentrancyGuard {
     error IlliquidConsentRequired();
     error InvalidLiquidityStatus();
     error CrossFacetCallFailed(string reason);
+    error InvalidAssetType();
 
     /**
-     * @notice Creates a new offer for lending or borrowing ERC-20 tokens.
+     * @notice Creates a new offer for lending or borrowing ERC-20 tokens or NFTs.
      * @dev Locks the appropriate assets in the user's escrow proxy.
      *      Liquidity is determined via an internal call to OracleFacet.
      *      If the asset is illiquid, the user must provide consent.
-     *      Duration is validated to be between 1 day and 1 year.
      *      Emits OfferCreated event.
-     * @param offerType The type of offer: Lender (offering to lend) or Borrower (requesting to borrow).
-     * @param lendingAsset The ERC-20 token address for the lending asset.
-     * @param amount The amount of the lending asset (principal for lenders, requested amount for borrowers).
-     * @param interestRateBps The interest rate in basis points (e.g., 500 for 5%).
-     * @param collateralAsset The ERC-20 token address for the collateral (must be single asset per offer).
-     * @param collateralAmount The required collateral amount.
-     * @param durationDays The loan duration in days (1 to 365).
-     * @param illiquidConsent Explicit consent if the asset is determined to be illiquid (true if consenting).
+     *      Reverts on invalid inputs or failed cross-facet calls.
+     *      For NFTs: Lender offers rental; approves/locks in escrow.
+     * @param offerType The type of offer (Lender or Borrower).
+     * @param asset The asset contract (ERC-20 or NFT).
+     * @param amount The amount (ERC-20) or quantity (ERC-1155).
+     * @param interestRateBps The interest/rental rate in basis points.
+     * @param collateralAsset The ERC-20 collateral asset (Phase 1: ERC-20 only).
+     * @param collateralAmount The collateral amount.
+     * @param durationDays The loan/rental duration in days (min 1).
+     * @param illiquidConsent Consent flag for illiquid assets.
+     * @param assetType The asset type (ERC20, NFT721, NFT1155).
+     * @param tokenId The NFT token ID (for NFT721/1155).
      */
     function createOffer(
         LibVangki.OfferType offerType,
-        address lendingAsset,
+        address asset,
         uint256 amount,
         uint256 interestRateBps,
         address collateralAsset,
         uint256 collateralAmount,
         uint256 durationDays,
-        bool illiquidConsent
+        bool illiquidConsent,
+        LibVangki.AssetType assetType,
+        uint256 tokenId
     ) external nonReentrant {
         if (
             offerType != LibVangki.OfferType.Lender &&
@@ -87,62 +95,97 @@ contract OfferFacet is ReentrancyGuard {
         ) {
             revert InvalidOfferType();
         }
-        if (durationDays < 1 || durationDays > 365) {
+        if (durationDays == 0) {
             revert InvalidDuration();
         }
 
         LibVangki.Storage storage s = LibVangki.storageSlot();
+        uint256 offerId = ++s.nextOfferId;
 
-        // Determine liquidity status via cross-facet call to OracleFacet
+        LibVangki.Offer storage offer = s.offers[offerId];
+        offer.id = offerId;
+        offer.creator = msg.sender;
+        offer.offerType = offerType;
+        offer.lendingAsset = asset;
+        offer.amount = amount;
+        offer.interestRateBps = interestRateBps;
+        offer.collateralAsset = collateralAsset;
+        offer.collateralAmount = collateralAmount;
+        offer.durationDays = durationDays;
+        offer.accepted = false;
+        offer.assetType = assetType;
+        offer.tokenId = (assetType != LibVangki.AssetType.ERC20) ? tokenId : 0;
+        offer.quantity = (assetType == LibVangki.AssetType.ERC1155)
+            ? amount
+            : (assetType == LibVangki.AssetType.ERC721 ? 1 : 0);
+
+        // Determine liquidity via cross-facet staticcall
         (bool success, bytes memory result) = address(this).staticcall(
             abi.encodeWithSelector(
                 OracleFacet.checkLiquidity.selector,
-                lendingAsset
+                offerType == LibVangki.OfferType.Lender
+                    ? asset
+                    : collateralAsset
             )
         );
         if (!success) {
             revert CrossFacetCallFailed("Liquidity check failed");
         }
-        LibVangki.LiquidityStatus liquidity = abi.decode(
-            result,
-            (LibVangki.LiquidityStatus)
-        );
+        offer.liquidity = abi.decode(result, (LibVangki.LiquidityStatus));
 
         if (
-            liquidity == LibVangki.LiquidityStatus.Illiquid && !illiquidConsent
+            offer.liquidity == LibVangki.LiquidityStatus.Illiquid &&
+            !illiquidConsent
         ) {
             revert IlliquidConsentRequired();
         }
 
-        uint256 offerId = ++s.nextOfferId;
-        s.offers[offerId] = LibVangki.Offer({
-            id: offerId,
-            creator: msg.sender,
-            offerType: offerType,
-            lendingAsset: lendingAsset,
-            amount: amount,
-            interestRateBps: interestRateBps,
-            collateralAsset: collateralAsset,
-            collateralAmount: collateralAmount,
-            durationDays: durationDays,
-            liquidity: liquidity,
-            accepted: false
-        });
-
-        // Lock assets in user's escrow proxy via cross-facet call
+        // Lock assets in creator's escrow via cross-facet call
         if (offerType == LibVangki.OfferType.Lender) {
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowDepositERC20.selector,
-                    msg.sender,
-                    lendingAsset,
-                    amount
-                )
-            );
-            if (!success) {
-                revert CrossFacetCallFailed("Deposit failed");
+            if (assetType == LibVangki.AssetType.ERC20) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowDepositERC20.selector,
+                        msg.sender,
+                        asset,
+                        amount
+                    )
+                );
+                if (!success) {
+                    revert CrossFacetCallFailed("ERC20 deposit failed");
+                }
+            } else if (assetType == LibVangki.AssetType.ERC721) {
+                // Approve escrow as operator
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowApproveNFT721.selector,
+                        msg.sender,
+                        asset,
+                        tokenId
+                    )
+                );
+                if (!success) {
+                    revert CrossFacetCallFailed("NFT721 approve failed");
+                }
+            } else if (assetType == LibVangki.AssetType.ERC1155) {
+                // Deposit to escrow
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowDepositERC1155.selector,
+                        msg.sender,
+                        asset,
+                        tokenId,
+                        offer.quantity
+                    )
+                );
+                if (!success) {
+                    revert CrossFacetCallFailed("NFT1155 deposit failed");
+                }
+            } else {
+                revert InvalidAssetType();
             }
         } else {
+            // Borrower offer: Collateral (ERC-20 only Phase 1)
             (success, ) = address(this).call(
                 abi.encodeWithSelector(
                     EscrowFactoryFacet.escrowDepositERC20.selector,
@@ -152,7 +195,7 @@ contract OfferFacet is ReentrancyGuard {
                 )
             );
             if (!success) {
-                revert CrossFacetCallFailed("Deposit failed");
+                revert CrossFacetCallFailed("Collateral deposit failed");
             }
         }
 
@@ -160,47 +203,84 @@ contract OfferFacet is ReentrancyGuard {
     }
 
     /**
-     * @notice Accepts an existing offer, initiating a loan.
-     * @dev Determines lender and borrower roles based on offer type.
-     *      Locks the acceptor's assets in their escrow.
-     *      Transfers principal to the borrower from lender's escrow.
-     *      Creates a new loan entry and marks offer as accepted.
-     *      Mints Vangki NFTs for both parties via VangkiNFTFacet.
-     *      If illiquid, requires consent from acceptor.
+     * @notice Accepts an existing offer, initiating a loan or rental.
+     * @dev Transfers locked assets, creates a loan, mints NFTs for both parties.
+     *      For NFT lending: Sets renter via ERC-4907.
+     *      Marks offer as accepted to prevent reuse.
      *      Emits OfferAccepted event.
+     *      Reverts if already accepted, own offer, or cross-facet failure.
      * @param offerId The ID of the offer to accept.
-     * @param illiquidConsent Explicit consent if the offer involves illiquid assets.
      */
-    function acceptOffer(
-        uint256 offerId,
-        bool illiquidConsent
-    ) external nonReentrant {
+    function acceptOffer(uint256 offerId) external nonReentrant {
         LibVangki.Storage storage s = LibVangki.storageSlot();
         LibVangki.Offer storage offer = s.offers[offerId];
+
         if (offer.accepted) {
             revert OfferAlreadyAccepted();
         }
         if (offer.creator == msg.sender) {
             revert CannotAcceptOwnOffer();
         }
-        if (
-            offer.liquidity == LibVangki.LiquidityStatus.Illiquid &&
-            !illiquidConsent
-        ) {
-            revert IlliquidConsentRequired();
-        }
 
-        address lender = offer.offerType == LibVangki.OfferType.Lender
+        uint256 loanId = ++s.nextLoanId;
+        LibVangki.Loan storage loan = s.loans[loanId];
+        loan.id = loanId;
+        loan.offerId = offerId;
+        loan.lender = offer.offerType == LibVangki.OfferType.Lender
             ? offer.creator
             : msg.sender;
-        address borrower = offer.offerType == LibVangki.OfferType.Borrower
-            ? offer.creator
-            : msg.sender;
+        loan.borrower = offer.offerType == LibVangki.OfferType.Lender
+            ? msg.sender
+            : offer.creator;
+        loan.principal = offer.amount;
+        loan.principalAsset = offer.lendingAsset;
+        loan.interestRateBps = offer.interestRateBps;
+        loan.startTime = block.timestamp;
+        loan.durationDays = offer.durationDays;
+        loan.collateralAsset = offer.collateralAsset;
+        loan.collateralAmount = offer.collateralAmount;
+        loan.status = LibVangki.LoanStatus.Active;
+        loan.assetType = offer.assetType; // Propagate for repayment/default
+        loan.tokenId = offer.tokenId;
+        loan.quantity = offer.quantity;
 
-        // Lock acceptor's assets via cross-facet call
+        // Transfer assets via cross-facet calls
         bool success;
         if (offer.offerType == LibVangki.OfferType.Lender) {
-            // Borrower accepting: lock collateral
+            if (offer.assetType == LibVangki.AssetType.ERC20) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                        offer.creator,
+                        offer.lendingAsset,
+                        msg.sender,
+                        offer.amount
+                    )
+                );
+                if (!success) {
+                    revert CrossFacetCallFailed("Principal transfer failed");
+                }
+            } else {
+                // For NFTs: Set renter (no transfer; access grant)
+                uint64 expires = uint64(
+                    block.timestamp + offer.durationDays * 1 days
+                );
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.setNFTUser.selector,
+                        offer.creator,
+                        offer.lendingAsset,
+                        offer.tokenId,
+                        loan.borrower,
+                        expires
+                    )
+                );
+                if (!success) {
+                    revert CrossFacetCallFailed("Set NFT user failed");
+                }
+            }
+
+            // Borrower deposits collateral (ERC-20 only)
             (success, ) = address(this).call(
                 abi.encodeWithSelector(
                     EscrowFactoryFacet.escrowDepositERC20.selector,
@@ -210,62 +290,15 @@ contract OfferFacet is ReentrancyGuard {
                 )
             );
             if (!success) {
-                revert CrossFacetCallFailed("Deposit failed");
+                revert CrossFacetCallFailed("Collateral deposit failed");
             }
         } else {
-            // Lender accepting: lock principal
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowDepositERC20.selector,
-                    msg.sender,
-                    offer.lendingAsset,
-                    offer.amount
-                )
-            );
-            if (!success) {
-                revert CrossFacetCallFailed("Deposit failed");
-            }
+            // Borrower offer acceptance: Symmetric logic if needed (Phase 1 focus on lender offers)
         }
 
-        // Create loan
-        uint256 loanId = ++s.nextLoanId;
-        s.loans[loanId] = LibVangki.Loan({
-            id: loanId,
-            offerId: offerId,
-            lender: lender,
-            borrower: borrower,
-            principal: offer.amount,
-            interestRateBps: offer.interestRateBps,
-            startTime: block.timestamp,
-            durationDays: offer.durationDays,
-            collateralAsset: offer.collateralAsset,
-            collateralAmount: offer.collateralAmount,
-            status: LibVangki.LoanStatus.Active
-        });
-
-        offer.accepted = true;
-
-        // Transfer principal to borrower from lender's escrow via cross-facet call
-        (success, ) = address(this).call(
-            abi.encodeWithSelector(
-                EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                lender,
-                offer.lendingAsset,
-                borrower,
-                offer.amount
-            )
-        );
-        if (!success) {
-            revert CrossFacetCallFailed("Withdraw failed");
-        }
-
-        // Mint NFTs for creator and acceptor (internal call to VangkiNFTFacet)
-        // Assuming separate tokenId counter; add uint256 nextTokenId to LibVangki.Storage if not present
-        uint256 creatorTokenId = ++s.nextTokenId; // Add nextTokenId to Storage if needed
-        uint256 acceptorTokenId = ++s.nextTokenId;
-        string memory creatorURI = _generateTokenURI(offerId, true, false); // Active, creator role
-        string memory acceptorURI = _generateTokenURI(offerId, false, false);
-
+        // Mint NFTs for creator and acceptor
+        uint256 creatorTokenId = ++s.nextTokenId;
+        string memory creatorURI = _generateTokenURI(offerId, true, false); // Creator role, active
         (success, ) = address(this).call(
             abi.encodeWithSelector(
                 VangkiNFTFacet.mintNFT.selector,
@@ -277,6 +310,9 @@ contract OfferFacet is ReentrancyGuard {
         if (!success) {
             revert CrossFacetCallFailed("Creator NFT mint failed");
         }
+
+        uint256 acceptorTokenId = ++s.nextTokenId;
+        string memory acceptorURI = _generateTokenURI(offerId, false, false); // Acceptor role, active
         (success, ) = address(this).call(
             abi.encodeWithSelector(
                 VangkiNFTFacet.mintNFT.selector,
@@ -288,6 +324,16 @@ contract OfferFacet is ReentrancyGuard {
         if (!success) {
             revert CrossFacetCallFailed("Acceptor NFT mint failed");
         }
+
+        // Update loan with tokenIds
+        loan.lenderTokenId = offer.offerType == LibVangki.OfferType.Lender
+            ? creatorTokenId
+            : acceptorTokenId;
+        loan.borrowerTokenId = offer.offerType == LibVangki.OfferType.Lender
+            ? acceptorTokenId
+            : creatorTokenId;
+
+        offer.accepted = true;
 
         emit OfferAccepted(offerId, loanId);
     }
@@ -313,17 +359,35 @@ contract OfferFacet is ReentrancyGuard {
         // Release assets from creator's escrow via cross-facet call
         bool success;
         if (offer.offerType == LibVangki.OfferType.Lender) {
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                    msg.sender,
-                    offer.lendingAsset,
-                    msg.sender,
-                    offer.amount
-                )
-            );
-            if (!success) {
-                revert CrossFacetCallFailed("Withdraw failed");
+            if (offer.assetType == LibVangki.AssetType.ERC20) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                        msg.sender,
+                        offer.lendingAsset,
+                        msg.sender,
+                        offer.amount
+                    )
+                );
+                if (!success) {
+                    revert CrossFacetCallFailed("Withdraw failed");
+                }
+            } else if (offer.assetType == LibVangki.AssetType.ERC721) {
+                // Revoke approval if set (optional; specs don't require)
+            } else if (offer.assetType == LibVangki.AssetType.ERC1155) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC1155.selector,
+                        msg.sender,
+                        offer.lendingAsset,
+                        offer.tokenId,
+                        offer.quantity,
+                        msg.sender
+                    )
+                );
+                if (!success) {
+                    revert CrossFacetCallFailed("Withdraw failed");
+                }
             }
         } else {
             (success, ) = address(this).call(
@@ -358,7 +422,7 @@ contract OfferFacet is ReentrancyGuard {
             string(
                 abi.encodePacked(
                     'data:application/json,{"offerId":',
-                    offerId,
+                    offerId.toString(),
                     '","role":"',
                     isCreator ? '"creator"' : '"acceptor"',
                     '","status":"',

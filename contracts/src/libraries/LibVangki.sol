@@ -19,14 +19,16 @@ library LibVangki {
     bytes32 internal constant VANGKI_STORAGE_POSITION =
         keccak256("vangki.storage");
 
+    error CrossFacetCallFailed(string reason);
+
     /**
      * @notice Enum for supported asset types.
      * @dev ERC20 for tokens, NFT721 for unique NFTs, NFT1155 for semi-fungible NFTs.
      */
     enum AssetType {
         ERC20,
-        NFT721,
-        NFT1155
+        ERC721,
+        ERC1155
     }
 
     /**
@@ -68,13 +70,16 @@ library LibVangki {
         address creator;
         OfferType offerType;
         address lendingAsset; // ERC20 or NFT contract
-        uint256 amount; // Principal/rental fee or quantity for NFTs
+        uint256 amount; // Principal/rental fee
         uint256 interestRateBps; // Basis points for interest/rental rate
         address collateralAsset; // ERC20 only for Phase 1
         uint256 collateralAmount;
         uint256 durationDays;
         LiquidityStatus liquidity;
         bool accepted;
+        uint256 tokenId; // For NFT721/1155; 0 for ERC20
+        uint256 quantity; // For ERC1155; 1 for ERC721; 0 for ERC20
+        AssetType assetType;
     }
 
     /**
@@ -87,13 +92,19 @@ library LibVangki {
         uint256 offerId;
         address lender;
         address borrower;
+        uint256 lenderTokenId;
+        uint256 borrowerTokenId;
         uint256 principal; // Lent amount or rental value
+        address principalAsset;
         uint256 interestRateBps;
         uint256 startTime; // Timestamp of initiation
         uint256 durationDays;
         address collateralAsset;
         uint256 collateralAmount;
         LoanStatus status;
+        uint256 tokenId; // For NFT lending assets
+        uint256 quantity; // For ERC1155
+        AssetType assetType;
     }
 
     struct RiskParams {
@@ -119,6 +130,8 @@ library LibVangki {
         mapping(address => address) userVangkiEscrows; // Per-user proxy addresses
         mapping(address => bool) liquidAssets; // Manual liquidity overrides
         mapping(address => RiskParams) assetRiskParams;
+        mapping(address => uint256) treasuryBalances;
+        mapping(address => string) userCountry; // ISO code, e.g., "US"
     }
 
     /**
@@ -132,5 +145,37 @@ library LibVangki {
         assembly {
             s.slot := position
         }
+    }
+
+    /// @dev Sets country
+    function setUserCountry(address user, string memory country) internal {
+        Storage storage s = storageSlot();
+        s.userCountry[user] = country;
+    }
+
+    /// @dev Calculates the grace period based on loan duration.
+    function gracePeriod(uint256 durationDays) internal pure returns (uint256) {
+        if (durationDays < 7) return 1 hours;
+        if (durationDays < 30) return 1 days;
+        if (durationDays < 90) return 3 days;
+        if (durationDays < 180) return 1 weeks;
+        return 2 weeks;
+    }
+
+    /// @dev Calculates late fees: 1% on first day post-due, +0.5% daily, capped at 5% of principal.
+    function calculateLateFee(
+        uint256 loanId,
+        uint256 endTime
+    ) internal view returns (uint256) {
+        LibVangki.Storage storage s = LibVangki.storageSlot();
+        LibVangki.Loan storage loan = s.loans[loanId];
+
+        if (block.timestamp <= endTime) return 0;
+
+        uint256 daysLate = (block.timestamp - endTime) / 1 days;
+        uint256 feePercent = 100 + (daysLate * 50); // 1% + 0.5% per day (in basis points)
+        if (feePercent > 500) feePercent = 500; // Cap 5%
+
+        return (loan.principal * feePercent) / 10000; // Basis points
     }
 }

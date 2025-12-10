@@ -8,8 +8,7 @@ import "../src/facets/DiamondCutFacet.sol";
 import "../src/facets/DiamondLoupeFacet.sol";
 import "../src/facets/OwnershipFacet.sol";
 import "../src/facets/OfferFacet.sol";
-import "../src/facets/LoanFacet.sol";
-import "../src/facets/EscrowFactoryFacet.sol";
+// import "../src/facets/EscrowFactoryFacet.sol";
 import "../src/facets/OracleFacet.sol";
 // import "../src/facets/VangkiNFTFacet.sol";
 import "../src/facets/RiskFacet.sol";
@@ -24,7 +23,6 @@ contract DeployDiamond is Script {
         DiamondLoupeFacet loupeFacet = new DiamondLoupeFacet();
         OwnershipFacet ownershipFacet = new OwnershipFacet();
         OfferFacet offerFacet = new OfferFacet();
-        LoanFacet loanFacet = new LoanFacet();
         EscrowFactoryFacet escrowFactoryFacet = new EscrowFactoryFacet();
         OracleFacet oracleFacet = new OracleFacet();
         VangkiNFTFacet nftFacet = new VangkiNFTFacet("", "", "", "");
@@ -70,15 +68,15 @@ contract DeployDiamond is Script {
             functionSelectors: offerSelectors
         });
 
-        // Cut for LoanFacet (add selectors; assume 2)
-        bytes4[] memory loanSelectors = new bytes4[](2);
-        loanSelectors[0] = LoanFacet.repayLoan.selector;
-        loanSelectors[1] = LoanFacet.triggerDefault.selector;
-        cuts[3] = IDiamondCut.FacetCut({
-            facetAddress: address(loanFacet),
-            action: IDiamondCut.FacetCutAction.Add,
-            functionSelectors: loanSelectors
-        });
+        // // Cut for LoanFacet (add selectors; assume 2)
+        // bytes4[] memory loanSelectors = new bytes4[](2);
+        // loanSelectors[0] = LoanFacet.repayLoan.selector;
+        // loanSelectors[1] = LoanFacet.triggerDefault.selector;
+        // cuts[3] = IDiamondCut.FacetCut({
+        //     facetAddress: address(loanFacet),
+        //     action: IDiamondCut.FacetCutAction.Add,
+        //     functionSelectors: loanSelectors
+        // });
 
         // Cut for EscrowFactoryFacet (add selectors; assume 5)
         bytes4[] memory escrowSelectors = new bytes4[](5);

@@ -4,312 +4,122 @@ pragma solidity ^0.8.29;
 
 import {LibVangki} from "../libraries/LibVangki.sol";
 import {LibDiamond} from "@diamond-3/libraries/LibDiamond.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {OracleFacet} from "./OracleFacet.sol"; // For potential LTV checks (stubbed for now)
-import {VangkiNFTFacet} from "./VangkiNFTFacet.sol"; // For NFT updates and burns
-import {EscrowFactoryFacet} from "./EscrowFactoryFacet.sol"; // For escrow selectors
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import {RiskFacet} from "./RiskFacet.sol"; // For initial HF check
+import {VangkiNFTFacet} from "./VangkiNFTFacet.sol"; // For updates
 
 /**
  * @title LoanFacet
  * @author Vangki Developer Team
- * @notice This facet handles loan repayment, closure, defaults, and liquidations in the Vangki P2P lending platform.
- * @dev This contract is part of the Diamond Standard (EIP-2535) and uses shared storage from LibVangki.
- *      It integrates with per-user escrow proxies for asset transfers.
- *      Interest is calculated using seconds-based accrual for precision.
- *      Late fees are applied post-due date within grace periods.
- *      Treasury collects 1% of interest and late fees.
- *      For liquid collateral, liquidation is stubbed (integrate DEX like 1inch later).
- *      For illiquid, full collateral transfer on default.
- *      NFTs are updated/burned via VangkiNFTFacet on closure/default.
- *      Custom errors for gas efficiency. ReentrancyGuard protects against attacks.
- *      Events emitted for all state changes.
- *      If this facet grows (e.g., with refinancing), consider splitting into RepayFacet, DefaultFacet, etc.
+ * @notice This facet handles loan initiation and general queries in the Vangki P2P lending platform.
+ * @dev New for Phase 1: Called from OfferFacet.acceptOffer to create loans.
+ *      Sets loan details, checks initial HF > min (1.5), updates NFTs.
+ *      Provides query functions (e.g., getLoanDetails).
+ *      Custom errors, ReentrancyGuard, Pausable.
+ *      Events for loan creation.
+ *      Gas optimized: Unchecked for IDs.
  */
-contract LoanFacet is ReentrancyGuard {
-    using SafeERC20 for IERC20;
-
-    /// @notice Emitted when a loan is successfully repaid.
-    /// @param loanId The ID of the repaid loan.
-    event LoanRepaid(uint256 indexed loanId);
-
-    /// @notice Emitted when a loan defaults.
-    /// @param loanId The ID of the defaulted loan.
-    event LoanDefaulted(uint256 indexed loanId);
-
-    /// @notice Emitted when a liquidation is triggered for liquid collateral.
-    /// @param loanId The ID of the liquidated loan.
-    /// @param proceeds The amount recovered from liquidation.
-    event LoanLiquidated(uint256 indexed loanId, uint256 proceeds);
+contract LoanFacet is ReentrancyGuard, Pausable {
+    /// @notice Emitted when a new loan is initiated.
+    /// @param loanId The unique ID of the loan.
+    /// @param offerId The associated offer ID.
+    /// @param lender The lender's address.
+    /// @param borrower The borrower's address.
+    event LoanInitiated(
+        uint256 indexed loanId,
+        uint256 indexed offerId,
+        address indexed lender,
+        address borrower
+    );
 
     // Custom errors for clarity and gas efficiency.
-    error NotBorrower();
-    error InvalidLoanStatus();
-    error RepaymentPastGracePeriod();
-    error NotDefaultedYet();
+    error InvalidOffer();
+    error HealthFactorTooLow();
     error CrossFacetCallFailed(string reason);
-    error InsufficientProceeds();
-    error LiquidationFailed();
 
     /**
-     * @notice Repays a loan, including principal, interest, and any late fees.
-     * @dev Calculates interest using seconds-based accrual.
-     *      Applies late fees if past due but within grace period.
-     *      Deducts treasury fee (1% of interest + late fees).
-     *      Releases collateral to borrower and funds to lender via escrow.
-     *      Updates loan status to Repaid and burns NFTs via VangkiNFTFacet.
-     *      Only callable by the borrower.
-     *      Emits LoanRepaid event.
-     * @param loanId The ID of the loan to repay.
+     * @notice Initiates a loan after offer acceptance.
+     * @dev Internal: Called by OfferFacet. Sets loan struct, checks HF.
+     *      Updates NFTs to "Loan Active".
+     *      Reverts if paused or low HF.
+     *      Emits LoanInitiated.
+     * @param offerId The accepted offer ID.
+     * @param acceptor The acceptor address (borrower or lender based on offerType).
+     * @return loanId The new loan ID.
      */
-    function repayLoan(uint256 loanId) external nonReentrant {
+    function initiateLoan(
+        uint256 offerId,
+        address acceptor
+    ) external nonReentrant whenNotPaused returns (uint256 loanId) {
+        if (msg.sender != address(this))
+            revert CrossFacetCallFailed("Unauthorized"); // Only via Diamond
+
         LibVangki.Storage storage s = LibVangki.storageSlot();
+        LibVangki.Offer storage offer = s.offers[offerId];
+        if (offer.id == 0 || offer.accepted) revert InvalidOffer();
+
+        unchecked {
+            loanId = ++s.nextLoanId;
+        }
+
         LibVangki.Loan storage loan = s.loans[loanId];
-        if (loan.borrower != msg.sender) {
-            revert NotBorrower();
-        }
-        if (loan.status != LibVangki.LoanStatus.Active) {
-            revert InvalidLoanStatus();
-        }
+        loan.id = loanId;
+        loan.offerId = offerId;
+        loan.startTime = block.timestamp;
+        loan.durationDays = offer.durationDays;
+        loan.interestRateBps = offer.interestRateBps;
+        loan.principal = offer.amount;
+        loan.collateralAmount = offer.collateralAmount;
+        loan.principalAsset = offer.lendingAsset;
+        loan.collateralAsset = offer.collateralAsset;
+        loan.tokenId = offer.tokenId;
+        loan.quantity = offer.quantity;
+        loan.assetType = offer.assetType;
+        loan.status = LibVangki.LoanStatus.Active;
 
-        uint256 durationSeconds = loan.durationDays * 1 days;
-        uint256 endTime = loan.startTime + durationSeconds;
-        uint256 grace = _gracePeriod(loan.durationDays);
-        if (block.timestamp > endTime + grace) {
-            revert RepaymentPastGracePeriod();
-        }
-
-        // Calculate interest (seconds-based)
-        uint256 elapsed = block.timestamp - loan.startTime;
-        uint256 interest = (loan.principal * loan.interestRateBps * elapsed) /
-            (365 days * 10000); // Basis points / 10000
-
-        // Calculate late fees
-        uint256 lateFee = _calculateLateFee(loanId, endTime);
-
-        uint256 totalDue = loan.principal + interest + lateFee;
-
-        LibVangki.Offer storage offer = s.offers[loan.offerId];
-        address lendingAsset = offer.lendingAsset;
-
-        // Transfer repayment to lender's escrow (borrower pays)
-        IERC20(lendingAsset).safeTransferFrom(
-            msg.sender,
-            _getUserEscrow(loan.lender),
-            totalDue
-        );
-
-        // Treasury fee: 1% of interest + late fees
-        uint256 treasuryAmount = (interest + lateFee) / 100;
-        // Transfer to treasury (stub: send to owner or dedicated address; expand later)
-        (bool success, ) = address(this).call(
-            abi.encodeWithSelector(
-                EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                loan.lender,
-                lendingAsset,
-                LibDiamond.contractOwner(),
-                treasuryAmount
-            )
-        );
-        if (!success) {
-            revert CrossFacetCallFailed("Treasury transfer failed");
-        }
-
-        // Release remaining to lender (principal + interest + late - treasury)
-        uint256 lenderAmount = totalDue - treasuryAmount;
-        (success, ) = address(this).call(
-            abi.encodeWithSelector(
-                EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                loan.lender,
-                lendingAsset,
-                loan.lender,
-                lenderAmount
-            )
-        );
-        if (!success) {
-            revert CrossFacetCallFailed("Lender withdraw failed");
-        }
-
-        // Release collateral to borrower
-        (success, ) = address(this).call(
-            abi.encodeWithSelector(
-                EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                loan.borrower,
-                loan.collateralAsset,
-                loan.borrower,
-                loan.collateralAmount
-            )
-        );
-        if (!success) {
-            revert CrossFacetCallFailed("Collateral release failed");
-        }
-
-        loan.status = LibVangki.LoanStatus.Repaid;
-
-        // Update and burn NFTs (internal call to VangkiNFTFacet; assume tokenIds stored or queryable)
-        // Stub: Call updateStatus and burn for both parties' NFTs
-        (success, ) = address(this).call(
-            abi.encodeWithSelector(
-                VangkiNFTFacet.updateNFTStatus.selector,
-                loanId,
-                "Loan Closed"
-            ) // Add updateNFTStatus to VangkiNFTFacet if needed
-        );
-        if (!success) {
-            revert CrossFacetCallFailed("NFT update failed");
-        }
-        // Burn calls similarly (add burnNFT to VangkiNFTFacet)
-
-        emit LoanRepaid(loanId);
-    }
-
-    /**
-     * @notice Triggers default and handles liquidation or full transfer for a loan past grace period.
-     * @dev Callable by anyone (e.g., lender or keeper).
-     *      For liquid collateral: Stub for DEX liquidation (integrate 1inch/Balancer later); distribute proceeds.
-     *      For illiquid: Full collateral transfer to lender.
-     *      Updates loan status to Defaulted.
-     *      Updates NFTs via VangkiNFTFacet.
-     *      Emits LoanDefaulted and LoanLiquidated (if applicable) events.
-     * @param loanId The ID of the loan to default.
-     */
-    function triggerDefault(uint256 loanId) external nonReentrant {
-        LibVangki.Storage storage s = LibVangki.storageSlot();
-        LibVangki.Loan storage loan = s.loans[loanId];
-        if (loan.status != LibVangki.LoanStatus.Active) {
-            revert InvalidLoanStatus();
-        }
-
-        uint256 endTime = loan.startTime + loan.durationDays * 1 days;
-        uint256 grace = _gracePeriod(loan.durationDays);
-        if (block.timestamp <= endTime + grace) {
-            revert NotDefaultedYet();
-        }
-
-        LibVangki.Offer storage offer = s.offers[loan.offerId];
-        bool success;
-
-        if (offer.liquidity == LibVangki.LiquidityStatus.Liquid) {
-            // Liquidation stub: Simulate/Integrate DEX sale (e.g., via 1inch aggregator)
-            // For now, assume full collateral value recovered; in reality, call external router
-            uint256 proceeds = loan.collateralAmount; // Placeholder; replace with actual sale
-            if (proceeds == 0) {
-                revert LiquidationFailed();
-            }
-
-            // Calculate due (principal + interest + late + penalty; stub penalty 0)
-            uint256 interest = (loan.principal *
-                loan.interestRateBps *
-                (block.timestamp - loan.startTime)) / (365 days * 10000);
-            uint256 lateFee = _calculateLateFee(loanId, endTime);
-            uint256 totalDue = loan.principal + interest + lateFee;
-
-            // Treasury on interest/late
-            uint256 treasuryAmount = (interest + lateFee) / 100;
-
-            if (proceeds < totalDue) {
-                // Under-recovery: Lender bears loss (as per doc)
-                revert InsufficientProceeds(); // Or handle partial
-            }
-
-            // Distribute: Treasury, lender full due - treasury, excess to borrower
-            // Stub transfers; use escrowWithdraw from borrower's escrow after "sale"
-            uint256 lenderAmount = totalDue - treasuryAmount;
-            // Transfer to treasury and lender (simulate)
-            uint256 excess = proceeds - totalDue;
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                    loan.borrower,
-                    loan.collateralAsset,
-                    loan.borrower,
-                    excess
-                )
-            );
-            if (!success) {
-                revert CrossFacetCallFailed("Excess return failed");
-            }
-
-            emit LoanLiquidated(loanId, proceeds);
+        if (offer.offerType == LibVangki.OfferType.Lender) {
+            loan.lender = offer.creator;
+            loan.borrower = acceptor;
         } else {
-            // Illiquid: Full collateral transfer to lender
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                    loan.borrower,
-                    loan.collateralAsset,
-                    loan.lender,
-                    loan.collateralAmount
-                )
-            );
-            if (!success) {
-                revert CrossFacetCallFailed("Full transfer failed");
-            }
+            loan.lender = acceptor;
+            loan.borrower = offer.creator;
         }
 
-        loan.status = LibVangki.LoanStatus.Defaulted;
-
-        // Update NFTs to "Loan Defaulted" (internal call)
-        (success, ) = address(this).call(
-            abi.encodeWithSelector(
-                VangkiNFTFacet.updateNFTStatus.selector,
-                loanId,
-                "Loan Defaulted"
-            )
-        );
-        if (!success) {
-            revert CrossFacetCallFailed("NFT update failed");
-        }
-
-        emit LoanDefaulted(loanId);
-    }
-
-    // Internal helpers
-
-    /// @dev Calculates the grace period based on loan duration.
-    function _gracePeriod(
-        uint256 durationDays
-    ) internal pure returns (uint256) {
-        if (durationDays < 7) return 1 hours;
-        if (durationDays < 30) return 1 days;
-        if (durationDays < 90) return 3 days;
-        if (durationDays < 180) return 1 weeks;
-        return 2 weeks;
-    }
-
-    /// @dev Calculates late fees: 1% on first day post-due, +0.5% daily, capped at 5% of principal.
-    function _calculateLateFee(
-        uint256 loanId,
-        uint256 endTime
-    ) internal view returns (uint256) {
-        LibVangki.Storage storage s = LibVangki.storageSlot();
-        LibVangki.Loan storage loan = s.loans[loanId];
-
-        if (block.timestamp <= endTime) {
-            return 0;
-        }
-
-        uint256 daysLate = (block.timestamp - endTime) / 1 days;
-        uint256 feePercent = 100 + (daysLate * 50); // 1% + 0.5% per day (in basis points)
-        if (feePercent > 500) {
-            feePercent = 500; // Cap 5%
-        }
-
-        return (loan.principal * feePercent) / 10000; // Basis points
-    }
-
-    // Helper to get user escrow (cross-facet staticcall)
-    function _getUserEscrow(address user) internal view returns (address) {
+        // Check initial HF via cross-facet staticcall
         (bool success, bytes memory result) = address(this).staticcall(
             abi.encodeWithSelector(
-                EscrowFactoryFacet.getOrCreateUserEscrow.selector,
-                user
+                RiskFacet.calculateHealthFactor.selector,
+                loanId
             )
         );
-        if (!success) {
-            revert CrossFacetCallFailed("Escrow query failed");
-        }
-        return abi.decode(result, (address));
+        if (!success) revert CrossFacetCallFailed("HF check failed");
+        uint256 hf = abi.decode(result, (uint256));
+        if (hf < 150 * 1e16) revert HealthFactorTooLow(); // Min 1.5
+
+        // Update NFTs to active loan status
+        (success, ) = address(this).call(
+            abi.encodeWithSelector(
+                VangkiNFTFacet.updateNFTStatus.selector,
+                loanId, // Use loanId for NFTs post-accept
+                "Loan Active"
+            )
+        );
+        if (!success) revert CrossFacetCallFailed("NFT update failed");
+
+        emit LoanInitiated(loanId, offerId, loan.lender, loan.borrower);
+    }
+
+    /**
+     * @notice Gets details of a loan.
+     * @dev View function for off-chain queries.
+     * @param loanId The loan ID.
+     * @return loan The Loan struct.
+     */
+    function getLoanDetails(
+        uint256 loanId
+    ) external view returns (LibVangki.Loan memory loan) {
+        LibVangki.Storage storage s = LibVangki.storageSlot();
+        return s.loans[loanId];
     }
 }
