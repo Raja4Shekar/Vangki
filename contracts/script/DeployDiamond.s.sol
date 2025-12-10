@@ -7,7 +7,7 @@ import "../src/VangkiDiamond.sol";
 import "../src/facets/DiamondCutFacet.sol";
 import "../src/facets/DiamondLoupeFacet.sol";
 import "../src/facets/OwnershipFacet.sol";
-import "../src/facets/OfferFacet.sol";
+// import "../src/facets/OfferFacet.sol";
 // import "../src/facets/EscrowFactoryFacet.sol";
 import "../src/facets/OracleFacet.sol";
 // import "../src/facets/VangkiNFTFacet.sol";
@@ -22,10 +22,10 @@ contract DeployDiamond is Script {
         DiamondCutFacet cutFacet = new DiamondCutFacet();
         DiamondLoupeFacet loupeFacet = new DiamondLoupeFacet();
         OwnershipFacet ownershipFacet = new OwnershipFacet();
-        OfferFacet offerFacet = new OfferFacet();
-        EscrowFactoryFacet escrowFactoryFacet = new EscrowFactoryFacet();
+        // OfferFacet offerFacet = new OfferFacet();
+        // EscrowFactoryFacet escrowFactoryFacet = new EscrowFactoryFacet();
         OracleFacet oracleFacet = new OracleFacet();
-        VangkiNFTFacet nftFacet = new VangkiNFTFacet("", "", "", "");
+        // VangkiNFTFacet nftFacet = new VangkiNFTFacet("", "", "", "");
         RiskFacet riskFacet = new RiskFacet();
 
         // Deploy Diamond (with owner as deployer; change to multi-sig if needed)
@@ -57,16 +57,16 @@ contract DeployDiamond is Script {
             functionSelectors: ownershipSelectors
         });
 
-        // Cut for OfferFacet (add selectors; assume 3 for example)
-        bytes4[] memory offerSelectors = new bytes4[](3);
-        offerSelectors[0] = OfferFacet.createOffer.selector;
-        offerSelectors[1] = OfferFacet.acceptOffer.selector;
-        offerSelectors[2] = OfferFacet.cancelOffer.selector;
-        cuts[2] = IDiamondCut.FacetCut({
-            facetAddress: address(offerFacet),
-            action: IDiamondCut.FacetCutAction.Add,
-            functionSelectors: offerSelectors
-        });
+        // // Cut for OfferFacet (add selectors; assume 3 for example)
+        // bytes4[] memory offerSelectors = new bytes4[](3);
+        // offerSelectors[0] = OfferFacet.createOffer.selector;
+        // offerSelectors[1] = OfferFacet.acceptOffer.selector;
+        // offerSelectors[2] = OfferFacet.cancelOffer.selector;
+        // cuts[2] = IDiamondCut.FacetCut({
+        //     facetAddress: address(offerFacet),
+        //     action: IDiamondCut.FacetCutAction.Add,
+        //     functionSelectors: offerSelectors
+        // });
 
         // // Cut for LoanFacet (add selectors; assume 2)
         // bytes4[] memory loanSelectors = new bytes4[](2);
@@ -78,22 +78,22 @@ contract DeployDiamond is Script {
         //     functionSelectors: loanSelectors
         // });
 
-        // Cut for EscrowFactoryFacet (add selectors; assume 5)
-        bytes4[] memory escrowSelectors = new bytes4[](5);
-        escrowSelectors[0] = EscrowFactoryFacet
-            .initializeEscrowImplementation
-            .selector;
-        escrowSelectors[1] = EscrowFactoryFacet.getOrCreateUserEscrow.selector;
-        escrowSelectors[2] = EscrowFactoryFacet.escrowDepositERC20.selector;
-        escrowSelectors[3] = EscrowFactoryFacet.escrowWithdrawERC20.selector;
-        escrowSelectors[4] = EscrowFactoryFacet
-            .upgradeEscrowImplementation
-            .selector;
-        cuts[4] = IDiamondCut.FacetCut({
-            facetAddress: address(escrowFactoryFacet),
-            action: IDiamondCut.FacetCutAction.Add,
-            functionSelectors: escrowSelectors
-        });
+        // // Cut for EscrowFactoryFacet (add selectors; assume 5)
+        // bytes4[] memory escrowSelectors = new bytes4[](5);
+        // escrowSelectors[0] = EscrowFactoryFacet
+        //     .initializeEscrowImplementation
+        //     .selector;
+        // escrowSelectors[1] = EscrowFactoryFacet.getOrCreateUserEscrow.selector;
+        // escrowSelectors[2] = EscrowFactoryFacet.escrowDepositERC20.selector;
+        // escrowSelectors[3] = EscrowFactoryFacet.escrowWithdrawERC20.selector;
+        // escrowSelectors[4] = EscrowFactoryFacet
+        //     .upgradeEscrowImplementation
+        //     .selector;
+        // cuts[4] = IDiamondCut.FacetCut({
+        //     facetAddress: address(escrowFactoryFacet),
+        //     action: IDiamondCut.FacetCutAction.Add,
+        //     functionSelectors: escrowSelectors
+        // });
 
         // Cut for OracleFacet (add selectors; assume 2)
         bytes4[] memory oracleSelectors = new bytes4[](2);
@@ -105,20 +105,20 @@ contract DeployDiamond is Script {
             functionSelectors: oracleSelectors
         });
 
-        // Cut for VangkiNFTFacet (add selectors; assume 3)
-        bytes4[] memory nftSelectors = new bytes4[](3);
-        nftSelectors[0] = VangkiNFTFacet.mintNFT.selector;
-        nftSelectors[1] = VangkiNFTFacet.updateNFTStatus.selector;
-        nftSelectors[2] = VangkiNFTFacet.burnNFT.selector;
-        cuts[6] = IDiamondCut.FacetCut({
-            facetAddress: address(nftFacet),
-            action: IDiamondCut.FacetCutAction.Add,
-            functionSelectors: nftSelectors
-        });
+        // // Cut for VangkiNFTFacet (add selectors; assume 3)
+        // bytes4[] memory nftSelectors = new bytes4[](3);
+        // nftSelectors[0] = VangkiNFTFacet.mintNFT.selector;
+        // nftSelectors[1] = VangkiNFTFacet.updateNFTStatus.selector;
+        // nftSelectors[2] = VangkiNFTFacet.burnNFT.selector;
+        // cuts[6] = IDiamondCut.FacetCut({
+        //     facetAddress: address(nftFacet),
+        //     action: IDiamondCut.FacetCutAction.Add,
+        //     functionSelectors: nftSelectors
+        // });
 
         // Cut for RiskFacet (add selectors; assume 2)
         bytes4[] memory riskSelectors = new bytes4[](2);
-        riskSelectors[0] = RiskFacet.updateAssetRiskParams.selector;
+        riskSelectors[0] = RiskFacet.updateRiskParams.selector;
         riskSelectors[1] = RiskFacet.calculateHealthFactor.selector;
         cuts[7] = IDiamondCut.FacetCut({
             facetAddress: address(riskFacet),
@@ -129,13 +129,13 @@ contract DeployDiamond is Script {
         // Execute diamondCut (no init calldata)
         IDiamondCut(address(diamond)).diamondCut(cuts, address(0), "");
 
-        // Initialize EscrowFactoryFacet
-        (bool success, ) = address(diamond).call(
-            abi.encodeWithSelector(
-                EscrowFactoryFacet.initializeEscrowImplementation.selector
-            )
-        );
-        require(success, "Escrow init failed");
+        // // Initialize EscrowFactoryFacet
+        // (bool success, ) = address(diamond).call(
+        //     abi.encodeWithSelector(
+        //         EscrowFactoryFacet.initializeEscrowImplementation.selector
+        //     )
+        // );
+        // require(success, "Escrow init failed");
 
         vm.stopBroadcast();
     }

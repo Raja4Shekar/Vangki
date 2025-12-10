@@ -80,6 +80,7 @@ library LibVangki {
         uint256 tokenId; // For NFT721/1155; 0 for ERC20
         uint256 quantity; // For ERC1155; 1 for ERC721; 0 for ERC20
         AssetType assetType;
+        bool useFullTermInterest;
     }
 
     /**
@@ -101,10 +102,12 @@ library LibVangki {
         uint256 durationDays;
         address collateralAsset;
         uint256 collateralAmount;
+        LiquidityStatus liquidity;
         LoanStatus status;
         uint256 tokenId; // For NFT lending assets
         uint256 quantity; // For ERC1155
         AssetType assetType;
+        bool useFullTermInterest;
     }
 
     struct RiskParams {
@@ -132,6 +135,7 @@ library LibVangki {
         mapping(address => RiskParams) assetRiskParams;
         mapping(address => uint256) treasuryBalances;
         mapping(address => string) userCountry; // ISO code, e.g., "US"
+        mapping(address => bool) kycVerified;
     }
 
     /**

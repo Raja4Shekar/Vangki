@@ -8,15 +8,16 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {OracleFacet} from "./OracleFacet.sol"; // For liquidity check
-import {RiskFacet} from "./RiskFacet.sol"; // For HF calc
+import {RiskFacet} from "./RiskFacet.sol"; // For LTV and HF calc
 import {EscrowFactoryFacet} from "./EscrowFactoryFacet.sol"; // For withdraw
 
 /**
  * @title PartialWithdrawalFacet
  * @author Vangki Developer Team
- * @notice This facet allows borrowers to withdraw partial collateral from active loans if post-withdrawal Health Factor remains above threshold.
+ * @notice This facet allows borrowers to withdraw partial collateral from active loans if post-withdrawal Health Factor remains above threshold and LTV below max.
  * @dev Part of Diamond Standard (EIP-2535). Uses shared LibVangki storage.
- *      Calculates max withdrawable to maintain min HF (e.g., 150%).
+ *      Calculates max withdrawable to maintain min HF (e.g., 150%) and max LTV (e.g., per asset maxLtvBps).
+ *      Enhanced: Integrated HF validation post-withdrawal (>= min HF) alongside LTV check.
  *      Disallows for illiquid assets ($0 value per specs).
  *      Custom errors, events, ReentrancyGuard. Cross-facet calls for oracle/risk/escrow.
  *      Callable only by borrower. Updates loan.collateralAmount.
@@ -30,11 +31,13 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
     /// @param borrower The borrower's address.
     /// @param amount The withdrawn collateral amount.
     /// @param newHF The post-withdrawal Health Factor (scaled to 1e18).
+    /// @param newLTV The post-withdrawal LTV (in bps).
     event PartialCollateralWithdrawn(
         uint256 indexed loanId,
         address indexed borrower,
         uint256 amount,
-        uint256 newHF
+        uint256 newHF,
+        uint256 newLTV
     );
 
     // Custom errors for gas efficiency and clarity.
@@ -44,15 +47,17 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
     error AmountTooHigh();
     error CrossFacetCallFailed(string reason);
     error HealthFactorTooLow();
+    error LTVExceeded(); // For post-withdrawal LTV > maxLtvBps
 
     // Constants (configurable via governance in Phase 2; align with RiskFacet)
     uint256 private constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
+    uint256 private constant HF_SCALE = 1e18;
+    uint256 private constant BASIS_POINTS = 10000;
 
     /**
      * @notice Allows borrower to withdraw partial collateral from an active loan.
-     * @dev Checks liquidity (must be liquid), calculates max withdrawable via simulated HF,
-     *      withdraws from escrow, updates loan.collateralAmount.
-     *      Reverts if illiquid or post-HF < min.
+     * @dev Checks liquidity (must be liquid), simulates post-HF >= min and post-LTV <= max, withdraws from escrow, updates loan.collateralAmount.
+     *      Reverts if illiquid, low HF, or high LTV post-withdrawal.
      *      Emits PartialCollateralWithdrawn.
      * @param loanId The active loan ID.
      * @param amount The collateral amount to withdraw (must <= max withdrawable).
@@ -68,42 +73,35 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
         if (amount == 0 || amount > loan.collateralAmount)
             revert AmountTooHigh();
 
-        // Check if collateral is liquid (illiquid = $0 value; no partial allowed per specs)
-        (bool success, bytes memory result) = address(this).staticcall(
+        // Check liquidity: Must be liquid
+        (bool liqSuccess, bytes memory liqResult) = address(this).staticcall(
             abi.encodeWithSelector(
                 OracleFacet.checkLiquidity.selector,
                 loan.collateralAsset
             )
         );
-        if (!success) revert CrossFacetCallFailed("Liquidity check failed");
-        LibVangki.LiquidityStatus liquidity = abi.decode(
-            result,
-            (LibVangki.LiquidityStatus)
-        );
-        if (liquidity != LibVangki.LiquidityStatus.Liquid)
-            revert IlliquidAsset();
+        if (
+            !liqSuccess ||
+            abi.decode(liqResult, (LibVangki.LiquidityStatus)) !=
+            LibVangki.LiquidityStatus.Liquid
+        ) revert IlliquidAsset();
 
-        // Simulate post-withdrawal HF (temporarily reduce collateralAmount)
-        uint256 originalCollateral = loan.collateralAmount;
-        loan.collateralAmount -= amount; // Temp reduce for sim
-        (success, result) = address(this).staticcall(
-            abi.encodeWithSelector(
-                RiskFacet.calculateHealthFactor.selector,
-                loanId
-            )
-        );
-        loan.collateralAmount = originalCollateral; // Restore
-        if (!success) revert CrossFacetCallFailed("HF sim failed");
-        uint256 simulatedHF = abi.decode(result, (uint256));
+        // Simulate post-withdrawal HF and LTV
+        uint256 tempCollateral = loan.collateralAmount - amount;
+        uint256 simulatedHF = _simulateHF(loan, tempCollateral);
         if (simulatedHF < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
 
-        // Withdraw from borrower's escrow to borrower
-        (success, ) = address(this).call(
+        uint256 simulatedLTV = _simulateLTV(loan, tempCollateral);
+        uint256 maxLtvBps = s.assetRiskParams[loan.collateralAsset].maxLtvBps;
+        if (simulatedLTV > maxLtvBps) revert LTVExceeded();
+
+        // Withdraw from escrow to borrower
+        (bool success, ) = address(this).call(
             abi.encodeWithSelector(
                 EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                msg.sender, // Borrower escrow
+                msg.sender,
                 loan.collateralAsset,
-                msg.sender, // To borrower
+                msg.sender,
                 amount
             )
         );
@@ -116,13 +114,14 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
             loanId,
             msg.sender,
             amount,
-            simulatedHF
+            simulatedHF,
+            simulatedLTV
         );
     }
 
     /**
      * @notice View function to calculate the maximum withdrawable collateral amount.
-     * @dev Simulates withdrawals to find max amount where HF >= min.
+     * @dev Simulates withdrawals to find max amount where HF >= min and LTV <= maxLtvBps.
      *      Binary search for efficiency (gas-optimized).
      *      Returns 0 for illiquid assets.
      * @param loanId The loan ID.
@@ -153,28 +152,21 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
             LibVangki.LiquidityStatus.Liquid
         ) return 0;
 
-        // Get current HF
-        (success, result) = address(this).staticcall(
-            abi.encodeWithSelector(
-                RiskFacet.calculateHealthFactor.selector,
-                loanId
-            )
-        );
-        if (!success || abi.decode(result, (uint256)) < MIN_HEALTH_FACTOR)
-            return 0;
-
-        // Binary search for max amount (efficient for large collaterals)
+        // Binary search for max amount
         uint256 low = 0;
         uint256 high = loan.collateralAmount;
         while (low < high) {
-            uint256 mid = (low + high + 1) / 2; // Ceiling to favor higher
+            uint256 mid = (low + high + 1) / 2; // Ceiling
             uint256 tempCollateral = loan.collateralAmount - mid;
 
-            // Sim HF (inline to avoid full facet call; assume RiskFacet logic)
-            // Note: For production, staticcall RiskFacet with tempCollateral; here stubbed for brevity
-            uint256 simHF = _simulateHF(loan, tempCollateral); // Implement or cross-call
+            // Simulate HF and LTV
+            uint256 simHF = _simulateHF(loan, tempCollateral);
+            uint256 simLTV = _simulateLTV(loan, tempCollateral);
+            uint256 maxLtvBps = s
+                .assetRiskParams[loan.collateralAsset]
+                .maxLtvBps;
 
-            if (simHF >= MIN_HEALTH_FACTOR) {
+            if (simHF >= MIN_HEALTH_FACTOR && simLTV <= maxLtvBps) {
                 low = mid;
             } else {
                 high = mid - 1;
@@ -183,12 +175,65 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
         return low;
     }
 
-    // Internal stub for HF sim (replace with RiskFacet staticcall in prod)
+    // Internal sim helpers (inline RiskFacet logic for tempCollateral; adjust decimals/prices as per Oracle)
+    /// @dev Simulates HF with temp collateral (riskAdjusted / borrowUSD * 1e18).
     function _simulateHF(
         LibVangki.Loan storage loan,
         uint256 tempCollateral
     ) internal view returns (uint256) {
-        // Stub: Full impl would calc borrowedValueUSD / (collateralValueUSD * liqThresholdBps)
-        return 200 * 1e16; // Example > min
+        LibVangki.Storage storage s = LibVangki.storageSlot();
+
+        uint256 currentBorrowBalance = _calculateCurrentBorrowBalance(loan);
+        (uint256 borrowPrice, uint8 borrowDecimals) = OracleFacet(address(this))
+            .getAssetPrice(loan.principalAsset);
+        uint256 borrowValueUSD = (currentBorrowBalance * borrowPrice) /
+            (10 ** borrowDecimals);
+
+        (uint256 collateralPrice, uint8 collateralDecimals) = OracleFacet(
+            address(this)
+        ).getAssetPrice(loan.collateralAsset);
+        uint256 collateralValueUSD = (tempCollateral * collateralPrice) /
+            (10 ** collateralDecimals);
+
+        uint256 liqThresholdBps = s
+            .assetRiskParams[loan.collateralAsset]
+            .liqThresholdBps;
+        uint256 riskAdjustedCollateral = (collateralValueUSD *
+            liqThresholdBps) / BASIS_POINTS;
+
+        if (borrowValueUSD == 0) return type(uint256).max;
+        return (riskAdjustedCollateral * HF_SCALE) / borrowValueUSD;
+    }
+
+    /// @dev Simulates LTV with temp collateral (borrowUSD * 10000 / collateralUSD).
+    function _simulateLTV(
+        LibVangki.Loan storage loan,
+        uint256 tempCollateral
+    ) internal view returns (uint256) {
+        uint256 currentBorrowBalance = _calculateCurrentBorrowBalance(loan);
+        (uint256 borrowPrice, uint8 borrowDecimals) = OracleFacet(address(this))
+            .getAssetPrice(loan.principalAsset);
+        uint256 borrowedValueUSD = (currentBorrowBalance * borrowPrice) /
+            (10 ** borrowDecimals);
+
+        (uint256 collateralPrice, uint8 collateralDecimals) = OracleFacet(
+            address(this)
+        ).getAssetPrice(loan.collateralAsset);
+        uint256 collateralValueUSD = (tempCollateral * collateralPrice) /
+            (10 ** collateralDecimals);
+        if (collateralValueUSD == 0) return type(uint256).max; // Infinite LTV
+
+        return (borrowedValueUSD * BASIS_POINTS) / collateralValueUSD;
+    }
+
+    // Internal helper for current borrow balance with accrued interest
+    function _calculateCurrentBorrowBalance(
+        LibVangki.Loan storage loan
+    ) internal view returns (uint256) {
+        uint256 elapsed = block.timestamp - loan.startTime;
+        uint256 accruedInterest = (loan.principal *
+            loan.interestRateBps *
+            (elapsed / 1 days)) / (365 * BASIS_POINTS);
+        return loan.principal + accruedInterest;
     }
 }

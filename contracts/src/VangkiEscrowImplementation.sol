@@ -10,48 +10,7 @@ import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
-
-/**
- * @title IERC4907
- * @notice Interface for ERC-4907 rentable NFTs.
- * @dev Defines functions for setting and querying temporary users.
- */
-interface IERC4907 {
-    /**
-     * @notice Emitted when the user of an NFT is changed or expires.
-     * @param tokenId The NFT token ID.
-     * @param user The new user address.
-     * @param expires The expiration timestamp.
-     */
-    event UpdateUser(
-        uint256 indexed tokenId,
-        address indexed user,
-        uint64 expires
-    );
-
-    /**
-     * @notice Sets the temporary user of an NFT.
-     * @dev Caller must be approved or owner.
-     * @param tokenId The token ID.
-     * @param user The temporary user address.
-     * @param expires The UNIX timestamp for expiration.
-     */
-    function setUser(uint256 tokenId, address user, uint64 expires) external;
-
-    /**
-     * @notice Gets the current user of an NFT.
-     * @param tokenId The token ID.
-     * @return The current user address (zero if expired or none).
-     */
-    function userOf(uint256 tokenId) external view returns (address);
-
-    /**
-     * @notice Gets the expiration timestamp for an NFT's user.
-     * @param tokenId The token ID.
-     * @return The expiration timestamp (zero if none).
-     */
-    function userExpires(uint256 tokenId) external view returns (uint64);
-}
+import "./interfaces/IERC4907.sol";
 
 /**
  * @title VangkiEscrowImplementation

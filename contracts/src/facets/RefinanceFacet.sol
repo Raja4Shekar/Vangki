@@ -7,12 +7,12 @@ import {LibDiamond} from "@diamond-3/libraries/LibDiamond.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {OracleFacet} from "./OracleFacet.sol"; // For Health Factor check
+import {OracleFacet} from "./OracleFacet.sol"; // For liquidity check
 import {VangkiNFTFacet} from "./VangkiNFTFacet.sol"; // For NFT updates
 import {EscrowFactoryFacet} from "./EscrowFactoryFacet.sol"; // For collateral/principal transfers
 import {RepayFacet} from "./RepayFacet.sol"; // For repayment calc
 import {OfferFacet} from "./OfferFacet.sol"; // For new offer acceptance
-import {RiskFacet} from "./RiskFacet.sol"; // For HF check
+import {RiskFacet} from "./RiskFacet.sol"; // For HF and LTV checks
 
 /**
  * @title RefinanceFacet
@@ -21,8 +21,8 @@ import {RiskFacet} from "./RiskFacet.sol"; // For HF check
  * @dev Part of Diamond Standard (EIP-2535). Uses shared LibVangki storage.
  *      Repays old loan using new principal, transfers collateral, handles shortfalls.
  *      Pro-rata interest for old lender (configurable via governance in Phase 2).
- *      Checks post-refinance Health Factor > min threshold (150%).
- *      Custom errors, events, ReentrancyGuard. Cross-facet calls for repayment/offers/NFTs.
+ *      Enhanced: Checks post-refinance HF >= min (1.5) and LTV <= maxLtvBps via RiskFacet.
+ *      Custom errors, events, ReentrancyGuard. Cross-facet calls for repayment/offers/NFTs/risk.
  *      Assumes treasury address in LibVangki (add if needed).
  *      Expand for Phase 2 (e.g., different collateral).
  */
@@ -50,6 +50,7 @@ contract RefinanceFacet is ReentrancyGuard {
     error LoanNotActive();
     error InvalidRefinanceOffer();
     error HealthFactorTooLow();
+    error LTVExceeded(); // New: Post-refinance LTV > max
     error CrossFacetCallFailed(string reason);
 
     // Constants (configurable via governance in Phase 2)
@@ -61,12 +62,14 @@ contract RefinanceFacet is ReentrancyGuard {
         address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
 
     /**
-     * @notice Allows borrower to refinance an active loan by accepting a new Borrower Offer.
-     * @dev Full process: Accept new offer, use new principal to repay old (principal + interest),
-     *      transfer collateral to new loan, pay shortfalls, update NFTs, check post-HF.
+     * @notice Allows borrower to refinance an active loan by accepting a new lender offer.
+     * @dev Repays old loan (principal + pro-rata interest) using new principal from new offer.
+     *      Handles interest shortfall if new terms lower. Transfers collateral to new escrow.
+     *      Enhanced: After new loan initiation, checks new HF >= min and LTV <= maxLtvBps.
+     *      Updates NFTs: Closes old, new ones minted in acceptOffer.
      *      Callable only by borrower. Emits LoanRefinanced.
-     * @param oldLoanId The existing loan ID to refinance.
-     * @param newOfferId The new Borrower Offer ID with better terms.
+     * @param oldLoanId The current loan ID to refinance.
+     * @param newOfferId The new lender offer ID to accept for refinancing.
      */
     function refinanceLoan(
         uint256 oldLoanId,
@@ -80,36 +83,30 @@ contract RefinanceFacet is ReentrancyGuard {
 
         LibVangki.Offer storage newOffer = s.offers[newOfferId];
         if (
-            newOffer.offerType != LibVangki.OfferType.Borrower ||
+            newOffer.offerType != LibVangki.OfferType.Lender ||
             newOffer.accepted
         ) revert InvalidRefinanceOffer();
+        if (newOffer.amount < oldLoan.principal) revert InvalidRefinanceOffer(); // Must cover principal
 
-        // Calculate old loan repayment amount (principal + pro-rata interest + late fees if any)
-        (bool success, bytes memory result) = address(this).staticcall(
-            abi.encodeWithSelector(
-                RepayFacet.calculateRepaymentAmount.selector, // Assume added helper in RepayFacet; or inline calc
-                oldLoanId
-            )
-        );
-        if (!success) revert CrossFacetCallFailed("Repayment calc failed");
-        uint256 repaymentAmount = abi.decode(result, (uint256));
-
-        // Accept new offer (get new principal from new lender)
-        (success, ) = address(this).call(
+        // Accept new offer (initiates new loan)
+        bool success;
+        bytes memory result;
+        (success, result) = address(this).call(
             abi.encodeWithSelector(OfferFacet.acceptOffer.selector, newOfferId)
         );
-        if (!success) revert CrossFacetCallFailed("New offer accept failed");
-        uint256 newLoanId = s.nextLoanId - 1; // Last created
+        if (!success) revert CrossFacetCallFailed("Accept new offer failed");
+        uint256 newLoanId = abi.decode(result, (uint256)); // Assume acceptOffer returns loanId
 
-        // Use new principal to repay old loan (transfer to old lender, treasury split)
-        uint256 treasuryFee = repaymentAmount / 100; // 1%
-        IERC20(oldLoan.principalAsset).safeTransfer(
+        // Repay old loan using new principal (transfer to old lender)
+        uint256 oldInterest = RepayFacet(address(this))
+            .calculateRepaymentAmount(oldLoanId) - oldLoan.principal; // Interest + late
+        IERC20(oldLoan.principalAsset).safeTransferFrom(
+            msg.sender,
             oldLoan.lender,
-            repaymentAmount - treasuryFee
-        );
-        _transferToTreasury(oldLoan.principalAsset, treasuryFee);
+            oldLoan.principal + oldInterest
+        ); // Specs: Borrower may pay shortfall
 
-        // Calculate shortfall (if new terms < old expected interest for full term)
+        // Handle shortfall if new offer interest lower (full-term comparison)
         uint256 oldExpectedInterest = (oldLoan.principal *
             oldLoan.interestRateBps *
             oldLoan.durationDays) / (365 * 10000);
@@ -148,7 +145,7 @@ contract RefinanceFacet is ReentrancyGuard {
         );
         if (!success) revert CrossFacetCallFailed("Collateral deposit failed");
 
-        // Check post-refinance Health Factor
+        // New: Check post-refinance HF >= min
         (success, result) = address(this).staticcall(
             abi.encodeWithSelector(
                 RiskFacet.calculateHealthFactor.selector,
@@ -158,6 +155,17 @@ contract RefinanceFacet is ReentrancyGuard {
         if (!success) revert CrossFacetCallFailed("HF calc failed");
         uint256 newHF = abi.decode(result, (uint256));
         if (newHF < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+
+        // New: Check post-refinance LTV <= maxLtvBps
+        (success, result) = address(this).staticcall(
+            abi.encodeWithSelector(RiskFacet.calculateLTV.selector, newLoanId)
+        );
+        if (!success) revert CrossFacetCallFailed("LTV calc failed");
+        uint256 newLTV = abi.decode(result, (uint256));
+        uint256 maxLtvBps = s
+            .assetRiskParams[oldLoan.collateralAsset]
+            .maxLtvBps; // Assume same collateral
+        if (newLTV > maxLtvBps) revert LTVExceeded();
 
         // Update NFTs: Close old, new ones already minted in acceptOffer
         (success, ) = address(this).call(
