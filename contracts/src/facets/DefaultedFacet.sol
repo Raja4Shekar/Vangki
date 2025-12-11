@@ -53,12 +53,12 @@ contract DefaultedFacet is ReentrancyGuard, Pausable {
     error KYCRequired();
 
     // Immutable 0x ExchangeProxy (mainnet; make configurable in Phase 2 via storage)
-    address private immutable ZERO_EX_PROXY =
-        0xDef1C0ded9bec7F1a1670819833240f027b25EfF;
+    // address private immutable ZERO_EX_PROXY =
+    //     0xDef1C0ded9bec7F1a1670819833240f027b25EfF;
 
     // Assume treasury (hardcoded; move to LibVangki)
-    address private immutable TREASURY =
-        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
+    // address private immutable TREASURY =
+    //     address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
 
     // Constants
     uint256 private constant BASIS_POINTS = 10000;
@@ -85,6 +85,8 @@ contract DefaultedFacet is ReentrancyGuard, Pausable {
         uint256 endTime = loan.startTime + loan.durationDays * 1 days;
         uint256 graceEnd = endTime + LibVangki.gracePeriod(loan.durationDays);
         if (block.timestamp <= graceEnd) revert NotDefaultedYet();
+
+        address treasury = _getTreasury();
 
         bool success;
         LibVangki.LiquidityStatus liquidity = OracleFacet(address(this))
@@ -190,7 +192,7 @@ contract DefaultedFacet is ReentrancyGuard, Pausable {
                     EscrowFactoryFacet.escrowWithdrawERC20.selector,
                     loan.borrower,
                     loan.collateralAsset,
-                    TREASURY,
+                    treasury,
                     loan.bufferAmount
                 )
             );
@@ -245,5 +247,10 @@ contract DefaultedFacet is ReentrancyGuard, Pausable {
         uint256 endTime = loan.startTime + loan.durationDays * 1 days;
         uint256 graceEnd = endTime + LibVangki.gracePeriod(loan.durationDays);
         return block.timestamp > graceEnd;
+    }
+
+    /// @dev Get Treasury Address
+    function _getTreasury() internal view returns (address) {
+        return LibVangki.storageSlot().treasury;
     }
 }

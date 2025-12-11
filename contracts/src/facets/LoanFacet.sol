@@ -86,6 +86,7 @@ contract LoanFacet is ReentrancyGuard, Pausable {
         loan.status = LibVangki.LoanStatus.Active;
         loan.liquidity = offer.liquidity; // Copy from offer
         loan.useFullTermInterest = offer.useFullTermInterest; // Assume added to Offer if per-loan
+        loan.prepayAsset = offer.prepayAsset;
 
         if (offer.offerType == LibVangki.OfferType.Lender) {
             loan.lender = offer.creator;

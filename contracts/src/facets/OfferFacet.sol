@@ -117,7 +117,8 @@ contract OfferFacet is ReentrancyGuard, Pausable {
         LibVangki.AssetType assetType,
         uint256 tokenId,
         uint256 quantity,
-        bool illiquidConsent
+        bool illiquidConsent,
+        address prepayAsset
     ) external whenNotPaused returns (uint256 offerId) {
         if (durationDays == 0) revert InvalidOfferType(); // Basic validation
 
@@ -140,6 +141,7 @@ contract OfferFacet is ReentrancyGuard, Pausable {
         offer.tokenId = tokenId;
         offer.quantity = quantity;
         offer.illiquidConsent = illiquidConsent;
+        offer.prepayAsset = prepayAsset;
 
         // Check liquidity
         LibVangki.LiquidityStatus liquidity = OracleFacet(address(this))
@@ -297,7 +299,7 @@ contract OfferFacet is ReentrancyGuard, Pausable {
             uint256 prepayAmount = offer.amount * offer.durationDays;
             uint256 buffer = (prepayAmount * RENTAL_BUFFER_BPS) / BASIS_POINTS;
             uint256 totalPrepay = prepayAmount + buffer;
-            IERC20(offer.collateralAsset).safeTransferFrom( // Assume collateralAsset is payment token; adjust if separate
+            IERC20(offer.prepayAsset).safeTransferFrom(
                 borrower,
                 borrowerEscrow,
                 totalPrepay

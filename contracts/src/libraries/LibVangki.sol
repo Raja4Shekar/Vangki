@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.29;
 
+import {LibDiamond} from "@diamond-3/libraries/LibDiamond.sol";
+
 /**
  * @title LibVangki
  * @author Vangki Developer Team
@@ -87,6 +89,7 @@ library LibVangki {
         AssetType assetType;
         bool useFullTermInterest;
         bool illiquidConsent;
+        address prepayAsset; // ERC20 for NFT rental fees (e.g., USDC); address(0) for ERC20 loans
     }
 
     /**
@@ -117,6 +120,7 @@ library LibVangki {
         uint256 prepayAmount;
         uint256 bufferAmount;
         uint256 lastDeductTime;
+        address prepayAsset; // ERC20 for NFT rental fees (e.g., USDC); address(0) for ERC20 loans
     }
 
     struct RiskParams {
@@ -124,6 +128,7 @@ library LibVangki {
         uint256 liqThresholdBps; // Liquidation Threshold in basis points
         uint256 liqBonusBps; // Liquidation Bonus in basis points
         uint256 reserveFactorBps; // Reserve Factor in basis points
+        uint256 minPartialBps; // Min partial repay % (e.g., 100 for 1%)
     }
 
     /**
@@ -133,19 +138,21 @@ library LibVangki {
      *      Expand with care to preserve layout for upgrades.
      */
     struct Storage {
-        mapping(uint256 => Offer) offers;
-        mapping(uint256 => Loan) loans;
         uint256 nextOfferId;
         uint256 nextLoanId;
         uint256 nextTokenId; // For Vangki NFTs
         address vangkiEscrowTemplate; // Shared UUPS implementation
+        address treasury; // Configurable treasury address
+        address zeroExProxy; // 0x proxy for liquidations
+        mapping(uint256 => uint256) loanToSaleOfferId;
+        mapping(uint256 => Offer) offers;
+        mapping(uint256 => Loan) loans;
         mapping(address => address) userVangkiEscrows; // Per-user proxy addresses
         mapping(address => bool) liquidAssets; // Manual liquidity overrides
         mapping(address => RiskParams) assetRiskParams;
         mapping(address => uint256) treasuryBalances;
         mapping(address => string) userCountry; // ISO code, e.g., "US"
         mapping(address => bool) kycVerified;
-        mapping(uint256 => uint256) loanToSaleOfferId;
     }
 
     /**
@@ -191,5 +198,19 @@ library LibVangki {
         if (feePercent > 500) feePercent = 500; // Cap 5%
 
         return (loan.principal * feePercent) / 10000; // Basis points
+    }
+
+    /// @dev set Treasury in initialize
+    function setTreasury(address newTreasury) internal {
+        LibDiamond.enforceIsContractOwner();
+        Storage storage s = storageSlot();
+        s.treasury = newTreasury;
+    }
+
+    /// @dev set 0x Proxy
+    function setZeroExProxy(address newProxy) internal {
+        LibDiamond.enforceIsContractOwner();
+        Storage storage s = storageSlot();
+        s.zeroExProxy = newProxy;
     }
 }

@@ -78,13 +78,13 @@ contract RiskFacet is ReentrancyGuard, Pausable {
     uint256 private constant HF_LIQUIDATION_THRESHOLD = 1e18; // HF < 1 for liquidation
     uint256 private constant KYC_THRESHOLD_USD = 2000 * 1e18; // $2k scaled
 
-    // Immutable 0x proxy
-    address private immutable ZERO_EX_PROXY =
-        0xDef1C0ded9bec7F1a1670819833240f027b25EfF;
+    // // Immutable 0x proxy
+    // address private immutable ZERO_EX_PROXY =
+    //     0xDef1C0ded9bec7F1a1670819833240f027b25EfF;
 
-    // Treasury (hardcoded; move to storage)
-    address private immutable TREASURY =
-        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA);
+    // // Treasury (hardcoded; move to storage)
+    // address private immutable TREASURY =
+    //     address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA);
 
     /**
      * @notice Updates risk parameters for an asset.
@@ -231,6 +231,8 @@ contract RiskFacet is ReentrancyGuard, Pausable {
         if (liquidity != LibVangki.LiquidityStatus.Liquid)
             revert NonLiquidAsset();
 
+        address zeroExProxy = _getZeroExProxy();
+
         // Liquidate: Withdraw collateral, swap via 0x
         bool success;
         (success, ) = address(this).call(
@@ -245,11 +247,11 @@ contract RiskFacet is ReentrancyGuard, Pausable {
         if (!success) revert CrossFacetCallFailed("Withdraw failed");
 
         IERC20(loan.collateralAsset).approve(
-            ZERO_EX_PROXY,
+            zeroExProxy,
             loan.collateralAmount
         );
 
-        (bool swapSuccess, bytes memory swapResult) = ZERO_EX_PROXY.call(
+        (bool swapSuccess, bytes memory swapResult) = zeroExProxy.call(
             fillData
         );
         if (!swapSuccess) {
@@ -324,5 +326,10 @@ contract RiskFacet is ReentrancyGuard, Pausable {
             loan.interestRateBps *
             elapsed) / (SECONDS_PER_YEAR * BASIS_POINTS);
         return loan.principal + accruedInterest;
+    }
+
+    /// @dev Get 0x Proxy address
+    function _getZeroExProxy() internal view returns (address) {
+        return LibVangki.storageSlot().zeroExProxy;
     }
 }

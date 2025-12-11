@@ -80,8 +80,8 @@ contract RepayFacet is ReentrancyGuard {
     uint256 private constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
 
     // Assume treasury (hardcoded; move to LibVangki)
-    address private immutable TREASURY =
-        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
+    // address private immutable TREASURY =
+    //     address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
 
     /**
      * @notice Repays an active loan in full.
@@ -108,6 +108,7 @@ contract RepayFacet is ReentrancyGuard {
 
         uint256 interest; // Or rental fee
         uint256 lateFee = LibVangki.calculateLateFee(loanId, endTime);
+        address treasury = _getTreasury();
 
         bool success;
         bytes memory result;
@@ -118,14 +119,14 @@ contract RepayFacet is ReentrancyGuard {
                     (loan.principal *
                         loan.interestRateBps *
                         loan.durationDays) /
-                    (365 * BASIS_POINTS);
+                    (SECONDS_PER_YEAR * BASIS_POINTS);
             } else {
                 uint256 elapsed = block.timestamp - loan.startTime;
                 interest =
                     (loan.principal *
                         loan.interestRateBps *
                         (elapsed / ONE_DAY)) /
-                    (365 * BASIS_POINTS);
+                    (SECONDS_PER_YEAR * BASIS_POINTS);
             }
 
             uint256 totalInterest = interest + lateFee;
@@ -141,7 +142,7 @@ contract RepayFacet is ReentrancyGuard {
             );
             IERC20(loan.principalAsset).safeTransferFrom(
                 msg.sender,
-                TREASURY,
+                treasury,
                 treasuryShare
             );
 
@@ -180,7 +181,7 @@ contract RepayFacet is ReentrancyGuard {
                 abi.encodeWithSelector(
                     EscrowFactoryFacet.escrowWithdrawERC20.selector,
                     msg.sender, // Borrower
-                    loan.collateralAsset, // Assume prepay in collateralAsset
+                    loan.prepayAsset,
                     loan.lender,
                     lenderShare
                 )
@@ -192,8 +193,8 @@ contract RepayFacet is ReentrancyGuard {
                 abi.encodeWithSelector(
                     EscrowFactoryFacet.escrowWithdrawERC20.selector,
                     msg.sender,
-                    loan.collateralAsset,
-                    TREASURY,
+                    loan.prepayAsset,
+                    treasury,
                     treasuryShare
                 )
             );
@@ -206,7 +207,7 @@ contract RepayFacet is ReentrancyGuard {
                 abi.encodeWithSelector(
                     EscrowFactoryFacet.escrowWithdrawERC20.selector,
                     msg.sender,
-                    loan.collateralAsset,
+                    loan.prepayAsset,
                     msg.sender,
                     refund
                 )
@@ -306,10 +307,15 @@ contract RepayFacet is ReentrancyGuard {
         if (loan.status != LibVangki.LoanStatus.Active)
             revert InvalidLoanStatus();
         if (partialAmount == 0) revert InsufficientPartialAmount();
+        uint256 minPartial = (loan.principal *
+            s.assetRiskParams[loan.principalAsset].minPartialBps) /
+            BASIS_POINTS;
+        if (partialAmount < minPartial) revert InsufficientPartialAmount();
 
         uint256 endTime = loan.startTime + loan.durationDays * ONE_DAY;
         uint256 graceEnd = endTime + LibVangki.gracePeriod(loan.durationDays);
         if (block.timestamp > graceEnd) revert RepaymentPastGracePeriod();
+        address treasury = _getTreasury();
 
         uint256 accrued;
         bool success;
@@ -319,7 +325,7 @@ contract RepayFacet is ReentrancyGuard {
             uint256 elapsed = block.timestamp - loan.startTime;
             accrued =
                 (loan.principal * loan.interestRateBps * (elapsed / ONE_DAY)) /
-                (365 * BASIS_POINTS);
+                (SECONDS_PER_YEAR * BASIS_POINTS);
 
             uint256 treasuryShare = (accrued * TREASURY_FEE_BPS) / BASIS_POINTS;
             uint256 lenderShare = accrued - treasuryShare;
@@ -335,7 +341,7 @@ contract RepayFacet is ReentrancyGuard {
             );
             IERC20(loan.principalAsset).safeTransferFrom(
                 msg.sender,
-                TREASURY,
+                treasury,
                 treasuryShare
             );
 
@@ -374,7 +380,7 @@ contract RepayFacet is ReentrancyGuard {
                     EscrowFactoryFacet.escrowWithdrawERC20.selector,
                     msg.sender,
                     loan.collateralAsset,
-                    TREASURY,
+                    treasury,
                     treasuryShare
                 )
             );
@@ -442,13 +448,14 @@ contract RepayFacet is ReentrancyGuard {
 
         uint256 treasuryShare = (dayFee * TREASURY_FEE_BPS) / BASIS_POINTS;
         uint256 lenderShare = dayFee - treasuryShare;
+        address treasury = _getTreasury();
 
         bool success;
         (success, ) = address(this).call(
             abi.encodeWithSelector(
                 EscrowFactoryFacet.escrowWithdrawERC20.selector,
                 loan.borrower,
-                loan.collateralAsset,
+                loan.prepayAsset,
                 loan.lender,
                 lenderShare
             )
@@ -459,8 +466,8 @@ contract RepayFacet is ReentrancyGuard {
             abi.encodeWithSelector(
                 EscrowFactoryFacet.escrowWithdrawERC20.selector,
                 loan.borrower,
-                loan.collateralAsset,
-                TREASURY,
+                loan.prepayAsset,
+                treasury,
                 treasuryShare
             )
         );
@@ -524,11 +531,11 @@ contract RepayFacet is ReentrancyGuard {
                     (loan.principal *
                         loan.interestRateBps *
                         loan.durationDays) /
-                    (365 * BASIS_POINTS);
+                    (SECONDS_PER_YEAR * BASIS_POINTS);
             } else {
                 interest =
                     (loan.principal * loan.interestRateBps * elapsedDays) /
-                    (365 * BASIS_POINTS);
+                    (SECONDS_PER_YEAR * BASIS_POINTS);
             }
             totalDue = loan.principal + interest;
         } else {
@@ -548,5 +555,10 @@ contract RepayFacet is ReentrancyGuard {
         }
 
         totalDue += lateFee;
+    }
+
+    /// @dev Get Treasury Address
+    function _getTreasury() internal view returns (address) {
+        return LibVangki.storageSlot().treasury;
     }
 }
