@@ -249,8 +249,8 @@ contract OfferFacet is ReentrancyGuard, Pausable {
             .getUserCountry(offer.creator);
         string memory acceptorCountry = ProfileFacet(address(this))
             .getUserCountry(msg.sender);
-        if (!canTradeBetween(creatorCountry, acceptorCountry))
-            revert CountriesNotCompatible(); // Placeholder func
+        if (!LibVangki.canTradeBetween(creatorCountry, acceptorCountry))
+            revert CountriesNotCompatible();
 
         // Calculate transaction value for KYC
         uint256 valueUSD = _calculateTransactionValueUSD(offer);
@@ -494,7 +494,7 @@ contract OfferFacet is ReentrancyGuard, Pausable {
             if (!offer.accepted) {
                 string memory creatorCountry = ProfileFacet(address(this))
                     .getUserCountry(offer.creator);
-                if (canTradeBetween(userCountry, creatorCountry)) {
+                if (LibVangki.canTradeBetween(userCountry, creatorCountry)) {
                     count++;
                 }
             }
@@ -507,7 +507,7 @@ contract OfferFacet is ReentrancyGuard, Pausable {
             if (!offer.accepted) {
                 string memory creatorCountry = ProfileFacet(address(this))
                     .getUserCountry(offer.creator);
-                if (canTradeBetween(userCountry, creatorCountry)) {
+                if (LibVangki.canTradeBetween(userCountry, creatorCountry)) {
                     offerIds[index++] = i;
                 }
             }
@@ -536,18 +536,6 @@ contract OfferFacet is ReentrancyGuard, Pausable {
         if (!success) revert GetUserEscrowFailed("Get User Escrow failed");
         proxy = abi.decode(result, (address));
         return (proxy);
-    }
-
-    /// @dev Placeholder for country trade compatibility (e.g., not US-IR, etc.).
-    ///      Expand with mapping(string => mapping(string => bool)) allowedTrades in LibVangki.
-    function canTradeBetween(
-        string memory countryA,
-        string memory countryB
-    ) internal pure returns (bool) {
-        bytes32 hashA = keccak256(bytes(countryA));
-        bytes32 hashB = keccak256(bytes(countryB));
-        bytes32 sanctionedHash = keccak256(bytes("IR")); // Example: Sanctioned "IR"
-        return hashA != sanctionedHash && hashB != sanctionedHash; // Simple; enhance as needed
     }
 
     /// @dev Simulates LTV with temp collateral (borrowUSD * 10000 / collateralUSD).

@@ -96,4 +96,22 @@ contract ProfileFacet is Pausable {
         LibVangki.Storage storage s = LibVangki.storageSlot();
         return s.kycVerified[user];
     }
+
+    /**
+     * @notice Sets trade allowance between two countries.
+     * @dev Owner-only (multi-sig). Calls LibVangki.setTradeAllowance.
+     *      Emits event if needed (add TradeAllowanceSet).
+     *      Callable when not paused.
+     * @param countryA ISO code for country A.
+     * @param countryB ISO code for country B.
+     * @param allowed True to allow, false to block.
+     */
+    function setTradeAllowance(
+        string calldata countryA,
+        string calldata countryB,
+        bool allowed
+    ) external whenNotPaused {
+        LibDiamond.enforceIsContractOwner();
+        LibVangki.setTradeAllowance(countryA, countryB, allowed);
+    }
 }

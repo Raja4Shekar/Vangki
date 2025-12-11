@@ -153,6 +153,7 @@ library LibVangki {
         mapping(address => uint256) treasuryBalances;
         mapping(address => string) userCountry; // ISO code, e.g., "US"
         mapping(address => bool) kycVerified;
+        mapping(bytes32 => mapping(bytes32 => bool)) allowedTrades; // hash(countryA) => hash(countryB) => true if A can trade with B
     }
 
     /**
@@ -198,6 +199,45 @@ library LibVangki {
         if (feePercent > 500) feePercent = 500; // Cap 5%
 
         return (loan.principal * feePercent) / 10000; // Basis points
+    }
+
+    /**
+     * @notice Sets trade allowance between two countries (owner-only).
+     * @dev Bidirectional by default (sets both A->B and B->A); for asymmetric, call twice.
+     *      Uses keccak256 for string hashing to save gas.
+     *      Callable via a facet (e.g., ProfileFacet) by Diamond owner.
+     * @param countryA ISO code for country A.
+     * @param countryB ISO code for country B.
+     * @param allowed True to allow trade, false to block.
+     */
+    function setTradeAllowance(
+        string memory countryA,
+        string memory countryB,
+        bool allowed
+    ) internal {
+        LibDiamond.enforceIsContractOwner();
+        Storage storage s = storageSlot();
+        bytes32 hashA = keccak256(bytes(countryA));
+        bytes32 hashB = keccak256(bytes(countryB));
+        s.allowedTrades[hashA][hashB] = allowed;
+        s.allowedTrades[hashB][hashA] = allowed; // Bidirectional; remove if asymmetric needed
+    }
+
+    /**
+     * @notice Checks if two countries can trade.
+     * @dev View helper; checks allowedTrades mapping (defaults false if unset).
+     * @param countryA ISO code for country A.
+     * @param countryB ISO code for country B.
+     * @return canTrade True if allowed.
+     */
+    function canTradeBetween(
+        string memory countryA,
+        string memory countryB
+    ) internal view returns (bool canTrade) {
+        Storage storage s = storageSlot();
+        bytes32 hashA = keccak256(bytes(countryA));
+        bytes32 hashB = keccak256(bytes(countryB));
+        return s.allowedTrades[hashA][hashB]; // Assumes bidirectional
     }
 
     /// @dev set Treasury in initialize
