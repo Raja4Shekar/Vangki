@@ -49,7 +49,7 @@ contract EarlyWithdrawalFacet is ReentrancyGuard {
     // Assume treasury address (add to LibVangki.Storage as address treasury;)
     // For now, hardcoded as immutable; make configurable.
     address private immutable TREASURY =
-        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual ##Treasury Account## ##**##**##
+        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
 
     /**
      * @notice Allows original lender to sell an active loan by accepting a new Lender Offer.
@@ -77,29 +77,29 @@ contract EarlyWithdrawalFacet is ReentrancyGuard {
         // Calculate accrued interest (forfeit to treasury)
         uint256 elapsed = block.timestamp - loan.startTime;
         uint256 accrued = (loan.principal * loan.interestRateBps * elapsed) /
-            (365 days * 10000);
+            (365 days * LibVangki.BASIS_POINTS);
         uint256 remainingDays = loan.durationDays - (elapsed / 1 days);
 
         // Calculate shortfall if new rate > original (Liam pays difference for remaining term)
         uint256 originalRemainingInterest = (loan.principal *
             loan.interestRateBps *
-            remainingDays) / (365 * 10000);
+            remainingDays) / (365 * LibVangki.BASIS_POINTS);
         uint256 newRemainingInterest = (loan.principal *
             buyOffer.interestRateBps *
-            remainingDays) / (365 * 10000);
+            remainingDays) / (365 * LibVangki.BASIS_POINTS);
         uint256 shortfall = 0;
         if (newRemainingInterest > originalRemainingInterest) {
             shortfall = newRemainingInterest - originalRemainingInterest;
             // Offset with accrued (specs: use accrued first, Liam pays remainder)
             if (accrued >= shortfall) {
                 uint256 excessAccrued = accrued - shortfall;
-                _transferToTreasury(loan.collateralAsset, excessAccrued); // Excess to treasury
+                _transferToTreasury(loan.principalAsset, excessAccrued); // Excess to treasury
                 accrued = 0; // All used
             } else {
                 uint256 remainingShortfall = shortfall - accrued;
-                IERC20(loan.collateralAsset).safeTransferFrom(
+                IERC20(loan.principalAsset).safeTransferFrom(
                     msg.sender,
-                    address(this),
+                    loan.lender,
                     remainingShortfall
                 );
                 shortfall = remainingShortfall; // For event
@@ -107,7 +107,7 @@ contract EarlyWithdrawalFacet is ReentrancyGuard {
             }
         } else {
             // No shortfall; all accrued to treasury
-            _transferToTreasury(loan.collateralAsset, accrued);
+            _transferToTreasury(loan.principalAsset, accrued);
         }
 
         // Transfer principal from new lender (Noah) to original (Liam)
@@ -126,26 +126,30 @@ contract EarlyWithdrawalFacet is ReentrancyGuard {
         // Update loan: new lender = Noah
         loan.lender = buyOffer.creator;
 
-        // Update NFTs: Close Liam's, mint new for Noah
+        // Update NFTs: Burn old lender NFT, mint new for Noah
         (success, ) = address(this).call(
             abi.encodeWithSelector(
-                VangkiNFTFacet.burnNFT.selector, // Assume burn for closed; or update status
+                VangkiNFTFacet.burnNFT.selector,
                 loan.lenderTokenId
             )
         );
         if (!success) revert CrossFacetCallFailed("Burn old NFT failed");
 
-        uint256 newTokenId = ++s.nextTokenId;
-        string memory newURI = _generateSaleURI(loanId, false, false); // Acceptor role, active
+        // Mint new NFT for Noah (lender role, active)
+        uint256 newTokenId;
+        unchecked {
+            newTokenId = ++s.nextTokenId;
+        }
         (success, ) = address(this).call(
             abi.encodeWithSelector(
                 VangkiNFTFacet.mintNFT.selector,
                 buyOffer.creator,
                 newTokenId,
-                newURI
+                "Lender" // Role
             )
         );
         if (!success) revert CrossFacetCallFailed("Mint new NFT failed");
+        loan.lenderTokenId = newTokenId; // Update loan struct
 
         // Mark buyOffer accepted
         buyOffer.accepted = true;
@@ -154,31 +158,35 @@ contract EarlyWithdrawalFacet is ReentrancyGuard {
     }
 
     /**
-     * @notice Allows original lender to create a sale offer as a "Borrower Offer".
-     * @dev Option 2: Liam creates offer mimicking borrow request for his loan position.
-     *      Specifies terms; new lender accepts it.
-     *      Reuses OfferFacet.createOffer internally (cross-facet).
+     * @notice Allows original lender to create a sale offer mimicking a Borrower Offer (Option 2).
+     * @dev Liam creates offer for his loan position; new lender accepts via OfferFacet.acceptOffer.
+     *      Terms: Remaining duration, same assets/collateral. Links offer to loan via new mapping.
+     *      Callable only by original lender. No event here (emitted on acceptance in OfferFacet).
      * @param loanId The loan ID to sell.
-     * @param interestRateBps Sale interest rate (may differ).
+     * @param interestRateBps The sale interest rate (may differ from original).
+     * @param illiquidConsent Consent for illiquid assets (if applicable).
      */
-
-    //  * @param otherTerms Other params matching specs (duration <= remaining, etc.).
     function createLoanSaleOffer(
         uint256 loanId,
-        uint256 interestRateBps
-    )
-        external
-        // Add params: asset, amount, collateral, durationDays, illiquidConsent
-        nonReentrant
-    {
+        uint256 interestRateBps,
+        bool illiquidConsent
+    ) external nonReentrant {
         LibVangki.Storage storage s = LibVangki.storageSlot();
         LibVangki.Loan storage loan = s.loans[loanId];
         if (loan.lender != msg.sender) revert NotLender();
         if (loan.status != LibVangki.LoanStatus.Active) revert LoanNotActive();
 
-        // Reuse OfferFacet.createOffer (set as Borrower type, but for sale)
+        // Calculate remaining days
+        uint256 elapsed = block.timestamp - loan.startTime;
+        uint256 remainingDays;
+        unchecked {
+            remainingDays = loan.durationDays - (elapsed / 1 days);
+        }
+
+        // Create mimicking Borrower Offer via cross-facet call
         bool success;
-        (success, ) = address(this).call(
+        bytes memory result;
+        (success, result) = address(this).call(
             abi.encodeWithSelector(
                 OfferFacet.createOffer.selector,
                 LibVangki.OfferType.Borrower, // Mimic Borrower for sale
@@ -187,31 +195,32 @@ contract EarlyWithdrawalFacet is ReentrancyGuard {
                 interestRateBps,
                 loan.collateralAsset,
                 loan.collateralAmount,
-                loan.durationDays -
-                    ((block.timestamp - loan.startTime) / 1 days), // Remaining days
-                true // Illiquid consent if needed
+                remainingDays,
+                loan.assetType,
+                loan.tokenId,
+                loan.quantity,
+                illiquidConsent
             )
         );
         if (!success) revert CrossFacetCallFailed("Sale offer creation failed");
 
-        // Link sale offer to loan (add mapping uint256 loanIdToSaleOfferId in LibVangki if needed)
-        // s.loanToSaleOffer[loanId] = s.nextOfferId - 1;
+        // Link sale offer to loan (assume added mapping in LibVangki: mapping(uint256 => uint256) loanToSaleOfferId;)
+        uint256 saleOfferId = abi.decode(result, (uint256)); // Assume createOffer returns id
+        s.loanToSaleOfferId[loanId] = saleOfferId;
     }
 
     // Internal helpers
+    /**
+     * @dev Transfers amount to treasury and updates balance.
+     * @param asset The ERC-20 asset.
+     * @param amount The amount to transfer.
+     */
     function _transferToTreasury(address asset, uint256 amount) internal {
+        if (amount == 0) return;
         LibVangki.Storage storage s = LibVangki.storageSlot();
-        s.treasuryBalances[asset] += amount;
+        unchecked {
+            s.treasuryBalances[asset] += amount;
+        }
         IERC20(asset).safeTransfer(TREASURY, amount);
-    }
-
-    // Stub for URI generation (reuse from VangkiNFTFacet or expand)
-    function _generateSaleURI(
-        uint256 id,
-        bool isCreator,
-        bool isClosed
-    ) internal pure returns (string memory) {
-        // Similar to VangkiNFTFacet._generateTokenURI
-        return string(abi.encodePacked("data:application/json,{...}")); // Expand as per specs
     }
 }

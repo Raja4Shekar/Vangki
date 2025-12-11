@@ -19,6 +19,11 @@ library LibVangki {
     bytes32 internal constant VANGKI_STORAGE_POSITION =
         keccak256("vangki.storage");
 
+    // Constants (configurable via governance in Phase 2)
+    uint256 constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
+    uint256 constant TREASURY_FEE_BPS = 100; // 1% of interest
+    uint256 constant BASIS_POINTS = 10000;
+
     error CrossFacetCallFailed(string reason);
 
     /**
@@ -81,6 +86,7 @@ library LibVangki {
         uint256 quantity; // For ERC1155; 1 for ERC721; 0 for ERC20
         AssetType assetType;
         bool useFullTermInterest;
+        bool illiquidConsent;
     }
 
     /**
@@ -108,6 +114,9 @@ library LibVangki {
         uint256 quantity; // For ERC1155
         AssetType assetType;
         bool useFullTermInterest;
+        uint256 prepayAmount;
+        uint256 bufferAmount;
+        uint256 lastDeductTime;
     }
 
     struct RiskParams {
@@ -136,6 +145,7 @@ library LibVangki {
         mapping(address => uint256) treasuryBalances;
         mapping(address => string) userCountry; // ISO code, e.g., "US"
         mapping(address => bool) kycVerified;
+        mapping(uint256 => uint256) loanToSaleOfferId;
     }
 
     /**

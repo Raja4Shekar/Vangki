@@ -9,6 +9,8 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {VangkiNFTFacet} from "./VangkiNFTFacet.sol"; // For NFT updates and burns
 import {EscrowFactoryFacet} from "./EscrowFactoryFacet.sol"; // For escrow selectors
+import {RiskFacet} from "./RiskFacet.sol"; // For post-repay HF check
+import {OracleFacet} from "./OracleFacet.sol"; // For value checks if needed
 
 /**
  * @title RepayFacet
@@ -26,6 +28,10 @@ import {EscrowFactoryFacet} from "./EscrowFactoryFacet.sol"; // For escrow selec
  *      Cross-facet calls for escrow/NFTs.
  *      Gas optimized: Unchecked math where safe, minimal storage reads.
  *      Note: Per-loan flag set during loan initiation (from Offer; see OfferFacet and LoanFacet updates).
+ *      Enhanced for NFT rentals: Treats "interest" as rental fee; deducts pro-rata (or full) from prepay held in escrow.
+ *      New: Partial repayments via repayPartial (reduces principal/duration/prepay).
+ *      New: Auto daily deduct for NFTs via autoDeductDaily (permissionless, checks daily elapsed).
+ *      Assume added Loan fields: uint256 prepayAmount, uint256 bufferAmount, uint256 lastDeductTime (set in acceptOffer/initiateLoan).
  */
 contract RepayFacet is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -40,31 +46,54 @@ contract RepayFacet is ReentrancyGuard {
         uint256 lateFeePaid
     );
 
+    /// @notice Emitted when a partial repayment is made.
+    /// @param loanId The ID of the loan.
+    /// @param amountRepaid The partial amount repaid (principal or days' fees).
+    /// @param newPrincipal The updated principal (for ERC20) or duration (for NFT).
+    event PartialRepaid(
+        uint256 indexed loanId,
+        uint256 amountRepaid,
+        uint256 newPrincipal
+    );
+
+    /// @notice Emitted when auto daily deduct is triggered for an NFT rental.
+    /// @param loanId The ID of the loan.
+    /// @param dayFeeDeducted The daily fee deducted.
+    event AutoDailyDeducted(uint256 indexed loanId, uint256 dayFeeDeducted);
+
     // Custom errors for clarity and gas efficiency.
     error NotBorrower();
     error InvalidLoanStatus();
     error RepaymentPastGracePeriod();
     error CrossFacetCallFailed(string reason);
+    error InsufficientPrepay();
+    error InsufficientPartialAmount();
+    error NotDailyYet();
+    error HealthFactorTooLow();
+    error NotNFTRental();
 
     // Constants
-    uint256 private constant BASIS_POINTS = 10000; // For bps calculations
+    uint256 private constant BASIS_POINTS = 10000;
     uint256 private constant TREASURY_FEE_BPS = 100; // 1%
+    uint256 private constant SECONDS_PER_YEAR = 365 days;
+    uint256 private constant ONE_DAY = 1 days;
+    uint256 private constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
 
-    // Assume treasury address (add to LibVangki.Storage as address treasury; hardcoded for now)
+    // Assume treasury (hardcoded; move to LibVangki)
     address private immutable TREASURY =
         address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
 
     /**
-     * @notice Repays a loan, including principal, configured interest, and any late fees.
-     * @dev Interest: Full-term or pro-rata based on per-loan flag (loan.useFullTermInterest).
-     *      If past maturity but within grace, adds late fees.
-     *      Distributes: Principal + 99% (interest + late) to lender; 1% to treasury.
-     *      Releases collateral from borrower's escrow to borrower.
-     *      For NFT lending: Resets renter (setUser to 0), returns if held (ERC1155).
-     *      Updates loan status to Repaid, updates and burns NFTs.
+     * @notice Repays an active loan in full.
+     * @dev Caller must approve totalDue (from calculateRepaymentAmount).
+     *      Handles ERC20/NFT differently: For ERC20, pays principal + interest/late.
+     *      For NFT, deducts accrued rental from prepay, refunds unused + buffer.
+     *      Distributes fees: 99% lender, 1% treasury.
+     *      Releases collateral/resets renter, burns NFTs, sets status Repaid.
+     *      Reverts if past grace or not borrower.
      *      Emits LoanRepaid.
      *      Callable only by borrower.
-     * @param loanId The active loan ID to repay.
+     * @param loanId The loan ID to repay.
      */
     function repayLoan(uint256 loanId) external nonReentrant {
         LibVangki.Storage storage s = LibVangki.storageSlot();
@@ -73,52 +102,50 @@ contract RepayFacet is ReentrancyGuard {
         if (loan.status != LibVangki.LoanStatus.Active)
             revert InvalidLoanStatus();
 
-        uint256 endTime = loan.startTime + loan.durationDays * 1 days;
+        uint256 endTime = loan.startTime + loan.durationDays * ONE_DAY;
         uint256 graceEnd = endTime + LibVangki.gracePeriod(loan.durationDays);
         if (block.timestamp > graceEnd) revert RepaymentPastGracePeriod();
 
-        // Calculate interest based on per-loan flag
-        uint256 interest;
-        if (loan.useFullTermInterest) {
-            interest =
-                (loan.principal * loan.interestRateBps * loan.durationDays) /
-                (365 * BASIS_POINTS);
-        } else {
-            uint256 elapsed = block.timestamp - loan.startTime;
-            interest =
-                (loan.principal * loan.interestRateBps * (elapsed / 1 days)) /
-                (365 * BASIS_POINTS);
-        }
+        uint256 interest; // Or rental fee
+        uint256 lateFee = LibVangki.calculateLateFee(loanId, endTime);
 
-        // Calculate late fee if past maturity
-        uint256 lateFee = 0;
-        if (block.timestamp > endTime) {
-            lateFee = LibVangki.calculateLateFee(loanId, endTime);
-        }
-
-        // Total fees = interest + lateFee
-        uint256 totalFees = interest + lateFee;
-        uint256 treasuryShare = (totalFees * TREASURY_FEE_BPS) / BASIS_POINTS;
-        uint256 lenderShare = totalFees - treasuryShare;
-
-        // Transfer from borrower: principal + lenderShare to lender, treasuryShare to treasury
-        IERC20(loan.principalAsset).safeTransferFrom(
-            msg.sender,
-            loan.lender,
-            loan.principal + lenderShare
-        );
-        IERC20(loan.principalAsset).safeTransferFrom(
-            msg.sender,
-            TREASURY,
-            treasuryShare
-        );
-
-        // Update treasury balance
-        s.treasuryBalances[loan.principalAsset] += treasuryShare;
-
-        // Release collateral to borrower
         bool success;
+        bytes memory result;
         if (loan.assetType == LibVangki.AssetType.ERC20) {
+            // ERC20 loan: Interest + late
+            if (loan.useFullTermInterest) {
+                interest =
+                    (loan.principal *
+                        loan.interestRateBps *
+                        loan.durationDays) /
+                    (365 * BASIS_POINTS);
+            } else {
+                uint256 elapsed = block.timestamp - loan.startTime;
+                interest =
+                    (loan.principal *
+                        loan.interestRateBps *
+                        (elapsed / ONE_DAY)) /
+                    (365 * BASIS_POINTS);
+            }
+
+            uint256 totalInterest = interest + lateFee;
+            uint256 treasuryShare = (totalInterest * TREASURY_FEE_BPS) /
+                BASIS_POINTS;
+            uint256 lenderShare = totalInterest - treasuryShare;
+
+            // Transfer from borrower
+            IERC20(loan.principalAsset).safeTransferFrom(
+                msg.sender,
+                loan.lender,
+                loan.principal + lenderShare
+            );
+            IERC20(loan.principalAsset).safeTransferFrom(
+                msg.sender,
+                TREASURY,
+                treasuryShare
+            );
+
+            // Release collateral
             (success, ) = address(this).call(
                 abi.encodeWithSelector(
                     EscrowFactoryFacet.escrowWithdrawERC20.selector,
@@ -130,13 +157,66 @@ contract RepayFacet is ReentrancyGuard {
             );
             if (!success)
                 revert CrossFacetCallFailed("Collateral release failed");
-        } // For NFT collateral: Similar, but specs Phase 1 ERC20 collateral for NFT lending
+        } else {
+            // NFT rental: Deduct full accrued from prepay
+            if (loan.prepayAmount == 0) revert InsufficientPrepay();
 
-        // For NFT lending (principal is NFT): Reset renter and return if held
-        if (loan.assetType != LibVangki.AssetType.ERC20) {
+            uint256 elapsedDays = (block.timestamp - loan.startTime) / ONE_DAY;
+            if (loan.useFullTermInterest) {
+                interest = loan.principal * loan.durationDays;
+            } else {
+                interest = loan.principal * elapsedDays;
+            }
+
+            uint256 totalDue = interest + lateFee;
+            if (totalDue > loan.prepayAmount) revert InsufficientPrepay();
+
+            uint256 treasuryShare = (totalDue * TREASURY_FEE_BPS) /
+                BASIS_POINTS;
+            uint256 lenderShare = totalDue - treasuryShare;
+
+            // Deduct from prepay in borrower escrow
             (success, ) = address(this).call(
                 abi.encodeWithSelector(
-                    EscrowFactoryFacet.setNFTUser.selector,
+                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                    msg.sender, // Borrower
+                    loan.collateralAsset, // Assume prepay in collateralAsset
+                    loan.lender,
+                    lenderShare
+                )
+            );
+            if (!success)
+                revert CrossFacetCallFailed("Lender share transfer failed");
+
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                    msg.sender,
+                    loan.collateralAsset,
+                    TREASURY,
+                    treasuryShare
+                )
+            );
+            if (!success)
+                revert CrossFacetCallFailed("Treasury share transfer failed");
+
+            // Refund unused prepay + buffer to borrower
+            uint256 refund = loan.prepayAmount - totalDue + loan.bufferAmount;
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                    msg.sender,
+                    loan.collateralAsset,
+                    msg.sender,
+                    refund
+                )
+            );
+            if (!success) revert CrossFacetCallFailed("Refund failed");
+
+            // Reset renter
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowSetNFTUser.selector,
                     loan.lender,
                     loan.principalAsset,
                     loan.tokenId,
@@ -144,8 +224,9 @@ contract RepayFacet is ReentrancyGuard {
                     0
                 )
             );
-            if (!success) revert CrossFacetCallFailed("Reset NFT user failed");
+            if (!success) revert CrossFacetCallFailed("Reset renter failed");
 
+            // If ERC1155, return tokens to lender
             if (loan.assetType == LibVangki.AssetType.ERC1155) {
                 (success, ) = address(this).call(
                     abi.encodeWithSelector(
@@ -157,11 +238,23 @@ contract RepayFacet is ReentrancyGuard {
                         loan.lender
                     )
                 );
-                if (!success) revert CrossFacetCallFailed("NFT return failed");
+                if (!success)
+                    revert CrossFacetCallFailed("Return ERC1155 failed");
             }
         }
 
-        // Update NFTs to "Loan Repaid" and burn
+        // Check post-repay HF (though full repay should improve it)
+        (success, result) = address(this).staticcall(
+            abi.encodeWithSelector(
+                RiskFacet.calculateHealthFactor.selector,
+                loanId
+            )
+        );
+        if (!success) revert CrossFacetCallFailed("HF check failed");
+        uint256 hf = abi.decode(result, (uint256));
+        if (hf < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+
+        // Common: Update NFTs and status
         (success, ) = address(this).call(
             abi.encodeWithSelector(
                 VangkiNFTFacet.updateNFTStatus.selector,
@@ -174,7 +267,7 @@ contract RepayFacet is ReentrancyGuard {
         (success, ) = address(this).call(
             abi.encodeWithSelector(
                 VangkiNFTFacet.burnNFT.selector,
-                loan.lenderTokenId // Assume fields in Loan struct; adjust if needed
+                loan.lenderTokenId
             )
         );
         if (!success) revert CrossFacetCallFailed("Burn lender NFT failed");
@@ -193,10 +286,224 @@ contract RepayFacet is ReentrancyGuard {
     }
 
     /**
+     * @notice Makes a partial repayment on an active loan.
+     * @dev For ERC20: Repays specified principal amount + accrued interest to date. Updates loan.principal.
+     *      For NFT: Repays for specified days (deducts days * amount from prepay), reduces durationDays and prepayAmount.
+     *      Distributes accrued fees. No late fees in partial (handled on full).
+     *      Checks post-HF >= min. Reverts if insufficient or past grace.
+     *      Emits PartialRepaid.
+     *      Callable only by borrower.
+     * @param loanId The loan ID.
+     * @param partialAmount The partial principal (ERC20) or days (NFT) to repay.
+     */
+    function repayPartial(
+        uint256 loanId,
+        uint256 partialAmount
+    ) external nonReentrant {
+        LibVangki.Storage storage s = LibVangki.storageSlot();
+        LibVangki.Loan storage loan = s.loans[loanId];
+        if (loan.borrower != msg.sender) revert NotBorrower();
+        if (loan.status != LibVangki.LoanStatus.Active)
+            revert InvalidLoanStatus();
+        if (partialAmount == 0) revert InsufficientPartialAmount();
+
+        uint256 endTime = loan.startTime + loan.durationDays * ONE_DAY;
+        uint256 graceEnd = endTime + LibVangki.gracePeriod(loan.durationDays);
+        if (block.timestamp > graceEnd) revert RepaymentPastGracePeriod();
+
+        uint256 accrued;
+        bool success;
+        bytes memory result;
+        if (loan.assetType == LibVangki.AssetType.ERC20) {
+            // ERC20: Accrued to now + partial principal
+            uint256 elapsed = block.timestamp - loan.startTime;
+            accrued =
+                (loan.principal * loan.interestRateBps * (elapsed / ONE_DAY)) /
+                (365 * BASIS_POINTS);
+
+            uint256 treasuryShare = (accrued * TREASURY_FEE_BPS) / BASIS_POINTS;
+            uint256 lenderShare = accrued - treasuryShare;
+
+            if (partialAmount > loan.principal)
+                revert InsufficientPartialAmount();
+
+            // Pay accrued + partial
+            IERC20(loan.principalAsset).safeTransferFrom(
+                msg.sender,
+                loan.lender,
+                partialAmount + lenderShare
+            );
+            IERC20(loan.principalAsset).safeTransferFrom(
+                msg.sender,
+                TREASURY,
+                treasuryShare
+            );
+
+            unchecked {
+                loan.principal -= partialAmount;
+            }
+            loan.startTime = block.timestamp; // Reset accrual start
+
+            emit PartialRepaid(loanId, partialAmount, loan.principal);
+        } else {
+            // NFT: Deduct for partialDays (partialAmount = days)
+            if (partialAmount > loan.durationDays)
+                revert InsufficientPartialAmount();
+
+            accrued = loan.principal * partialAmount; // Daily fee * days
+
+            if (accrued > loan.prepayAmount) revert InsufficientPrepay();
+
+            uint256 treasuryShare = (accrued * TREASURY_FEE_BPS) / BASIS_POINTS;
+            uint256 lenderShare = accrued - treasuryShare;
+
+            // Deduct from prepay
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                    msg.sender,
+                    loan.collateralAsset,
+                    loan.lender,
+                    lenderShare
+                )
+            );
+            if (!success) revert CrossFacetCallFailed("Lender share failed");
+
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                    msg.sender,
+                    loan.collateralAsset,
+                    TREASURY,
+                    treasuryShare
+                )
+            );
+            if (!success) revert CrossFacetCallFailed("Treasury share failed");
+
+            unchecked {
+                loan.prepayAmount -= accrued;
+                loan.durationDays -= partialAmount;
+            }
+
+            // Update renter expires if reduced
+            uint64 newExpires = uint64(
+                loan.startTime + loan.durationDays * ONE_DAY
+            );
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowSetNFTUser.selector,
+                    loan.lender,
+                    loan.principalAsset,
+                    loan.tokenId,
+                    msg.sender, // Still renter
+                    newExpires
+                )
+            );
+            if (!success) revert CrossFacetCallFailed("Update expires failed");
+
+            emit PartialRepaid(loanId, partialAmount, loan.durationDays);
+        }
+
+        // Post-repay HF check
+        (success, result) = address(this).staticcall(
+            abi.encodeWithSelector(
+                RiskFacet.calculateHealthFactor.selector,
+                loanId
+            )
+        );
+        if (!success) revert CrossFacetCallFailed("HF check failed");
+        uint256 hf = abi.decode(result, (uint256));
+        if (hf < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+    }
+
+    /**
+     * @notice Permissionless auto deduct for NFT rental daily fee.
+     * @dev Callable by anyone after each day (checks lastDeductTime + 1 day <= now).
+     *      Deducts one day's fee from prepay to lender (99%) and treasury (1%).
+     *      Updates lastDeductTime, reduces prepayAmount and durationDays by 1.
+     *      If insufficient prepay, reverts (default via DefaultedFacet).
+     *      No incentive yet (Phase 2: Small bounty from treasury).
+     *      Reverts if not NFT or not daily yet.
+     *      Emits AutoDailyDeducted.
+     * @param loanId The NFT rental loan ID.
+     */
+    function autoDeductDaily(uint256 loanId) external nonReentrant {
+        LibVangki.Storage storage s = LibVangki.storageSlot();
+        LibVangki.Loan storage loan = s.loans[loanId];
+        if (loan.status != LibVangki.LoanStatus.Active)
+            revert InvalidLoanStatus();
+        if (loan.assetType == LibVangki.AssetType.ERC20) revert NotNFTRental();
+
+        if (block.timestamp < loan.lastDeductTime + ONE_DAY)
+            revert NotDailyYet();
+
+        uint256 dayFee = loan.principal; // Daily rental fee
+        if (dayFee > loan.prepayAmount) revert InsufficientPrepay();
+
+        uint256 treasuryShare = (dayFee * TREASURY_FEE_BPS) / BASIS_POINTS;
+        uint256 lenderShare = dayFee - treasuryShare;
+
+        bool success;
+        (success, ) = address(this).call(
+            abi.encodeWithSelector(
+                EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                loan.borrower,
+                loan.collateralAsset,
+                loan.lender,
+                lenderShare
+            )
+        );
+        if (!success) revert CrossFacetCallFailed("Lender deduct failed");
+
+        (success, ) = address(this).call(
+            abi.encodeWithSelector(
+                EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                loan.borrower,
+                loan.collateralAsset,
+                TREASURY,
+                treasuryShare
+            )
+        );
+        if (!success) revert CrossFacetCallFailed("Treasury deduct failed");
+
+        unchecked {
+            loan.prepayAmount -= dayFee;
+            loan.durationDays -= 1;
+            loan.lastDeductTime += ONE_DAY;
+        }
+
+        // Update renter expires
+        uint64 newExpires = uint64(
+            loan.startTime + loan.durationDays * ONE_DAY
+        );
+        (success, ) = address(this).call(
+            abi.encodeWithSelector(
+                EscrowFactoryFacet.escrowSetNFTUser.selector,
+                loan.lender,
+                loan.principalAsset,
+                loan.tokenId,
+                loan.borrower,
+                newExpires
+            )
+        );
+        if (!success) revert CrossFacetCallFailed("Update expires failed");
+
+        // If duration 0, close loan (optional; or require full repay)
+        if (loan.durationDays == 0) {
+            loan.status = LibVangki.LoanStatus.Repaid;
+            // Burn NFTs, etc. (call internal close logic)
+        }
+
+        emit AutoDailyDeducted(loanId, dayFee);
+    }
+
+    /**
      * @notice View function to calculate the repayment amount for a loan.
      * @dev Includes principal, configured interest (per-loan flag), and late fees (if applicable).
+     *      Enhanced for NFTs: Returns prepay due (accrued rental + late) + refunds unused.
+     *      But for repay call, borrower approves total principal (unused refunded internally).
      * @param loanId The loan ID.
-     * @return totalDue The total repayment amount (principal + interest + lateFee).
+     * @return totalDue The total repayment amount (principal + interest + lateFee for ERC20; 0 for NFT as from prepay).
      */
     function calculateRepaymentAmount(
         uint256 loanId
@@ -205,19 +512,33 @@ contract RepayFacet is ReentrancyGuard {
         LibVangki.Loan storage loan = s.loans[loanId];
         if (loan.status != LibVangki.LoanStatus.Active) return 0;
 
-        uint256 endTime = loan.startTime + loan.durationDays * 1 days;
+        uint256 endTime = loan.startTime + loan.durationDays * ONE_DAY;
 
-        // Interest based on per-loan flag
+        // Interest/Rental based on per-loan flag
         uint256 interest;
-        if (loan.useFullTermInterest) {
-            interest =
-                (loan.principal * loan.interestRateBps * loan.durationDays) /
-                (365 * BASIS_POINTS);
+        uint256 elapsed = block.timestamp - loan.startTime;
+        uint256 elapsedDays = elapsed / ONE_DAY;
+        if (loan.assetType == LibVangki.AssetType.ERC20) {
+            if (loan.useFullTermInterest) {
+                interest =
+                    (loan.principal *
+                        loan.interestRateBps *
+                        loan.durationDays) /
+                    (365 * BASIS_POINTS);
+            } else {
+                interest =
+                    (loan.principal * loan.interestRateBps * elapsedDays) /
+                    (365 * BASIS_POINTS);
+            }
+            totalDue = loan.principal + interest;
         } else {
-            uint256 elapsed = block.timestamp - loan.startTime;
-            interest =
-                (loan.principal * loan.interestRateBps * (elapsed / 1 days)) /
-                (365 * BASIS_POINTS);
+            // NFT: Accrued rental
+            if (loan.useFullTermInterest) {
+                interest = loan.principal * loan.durationDays;
+            } else {
+                interest = loan.principal * elapsedDays;
+            }
+            totalDue = 0; // From prepay; borrower approves principal for safety, but internal deduct
         }
 
         // Late fee if past endTime
@@ -226,6 +547,6 @@ contract RepayFacet is ReentrancyGuard {
             lateFee = LibVangki.calculateLateFee(loanId, endTime);
         }
 
-        totalDue = loan.principal + interest + lateFee;
+        totalDue += lateFee;
     }
 }

@@ -8,6 +8,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol"; // Added for NFT support
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol"; // Added for NFT support
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol"; // Added for pausable
@@ -31,6 +32,10 @@ import "../interfaces/IERC4907.sol";
  *      Custom errors. ReentrancyGuard protects against reentrancy attacks.
  *      Events for all state changes. Cross-facet calls use low-level call on address(this).
  *      Gas optimized: Unchecked math for IDs, minimal storage reads.
+ *      Enhanced: Added NFT renting logic in createOffer (approve/deposit NFT) and acceptOffer (prepay lock with 5% buffer, set renter via escrow).
+ *      Daily deduct handled pro-rata in RepayFacet (from prepay). Buffer to treasury on default/repay.
+ *      Added KYC check in acceptOffer if valueUSD > KYC_THRESHOLD_USD.
+ *      Added getCompatibleOffers for country filtering (assumes canTradeWith function; simple != "sanctioned" placeholder).
  */
 contract OfferFacet is ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -46,373 +51,341 @@ contract OfferFacet is ReentrancyGuard, Pausable {
         LibVangki.OfferType offerType
     );
 
-    /// @notice Emitted when an offer is accepted, initiating a loan.
+    /// @notice Emitted when an offer is accepted.
     /// @param offerId The ID of the accepted offer.
-    /// @param loanId The ID of the newly created loan.
-    event OfferAccepted(uint256 indexed offerId, uint256 indexed loanId);
+    /// @param acceptor The address of the user accepting the offer.
+    /// @param loanId The ID of the initiated loan.
+    event OfferAccepted(
+        uint256 indexed offerId,
+        address indexed acceptor,
+        uint256 loanId
+    );
 
-    /// @notice Emitted when an offer is cancelled.
-    /// @param offerId The ID of the cancelled offer.
-    event OfferCancelled(uint256 indexed offerId);
+    /// @notice Emitted when an offer is canceled.
+    /// @param offerId The ID of the canceled offer.
+    /// @param creator The address of the creator canceling the offer.
+    event OfferCanceled(uint256 indexed offerId, address indexed creator);
 
-    // Custom errors for better gas efficiency and clarity.
+    // Custom errors for clarity and gas efficiency.
     error InvalidOfferType();
-    error InvalidDuration();
+    error InvalidAssetType();
     error OfferAlreadyAccepted();
     error NotOfferCreator();
-    error CannotAcceptOwnOffer();
-    error IlliquidConsentRequired();
-    error InvalidLiquidityStatus();
+    error InsufficientAllowance();
+    error LiquidityMismatch();
+    error CountriesNotCompatible(); // New: For sanctions filtering
+    error KYCRequired(); // New: For >$2k transactions
     error CrossFacetCallFailed(string reason);
-    error InvalidAssetType();
-    error CountrySanctioned(); // For sanctions filtering
-    error InvalidNFT(); // For NFT validation
-    error KYCRequiredForHighValue(); // New: For transaction value > $2k liquid
+    error GetUserEscrowFailed(string reason);
 
     // Constants
-    uint256 private constant KYC_THRESHOLD_USD = 2000 * 1e18; // $2k scaled (assuming 18 decimals for USD prices)
+    uint256 private constant KYC_THRESHOLD_USD = 2000 * 1e18; // $2k scaled to 1e18 for comparison
+    uint256 private constant RENTAL_BUFFER_BPS = 500; // 5% buffer for NFT rentals
+    uint256 private constant BASIS_POINTS = 10000;
 
     /**
-     * @notice Creates a new offer for lending or borrowing ERC-20 tokens or NFTs.
-     * @dev Locks the appropriate assets in the user's escrow proxy.
-     *      Liquidity is determined via an internal call to OracleFacet.
-     *      Mints an NFT for the creator representing the offer.
-     *      Enhanced: Supports NFT lending (approvals for ERC721, transfer for ERC1155).
-     *      Validates rentable NFTs (checks IERC4907 support via try-catch).
-     *      Reverts if paused or sanctioned country.
-     *      Illiquid Handling: Requires consent if illiquid; sets liquidity flag.
+     * @notice Creates a new offer (Lender or Borrower).
+     * @dev Deposits/locks assets into user's escrow (via EscrowFactoryFacet).
+     *      For Lender: Deposits lending amount (ERC20) or approves/escrows NFT.
+     *      For Borrower: Locks collateral (ERC20/NFT).
+     *      Checks liquidity; mints NFT for the offer.
+     *      Enhanced: For NFT lending (Lender), if ERC721: approve escrow as operator; ERC1155: deposit tokens.
+     *      Reverts if paused or invalid params.
      *      Emits OfferCreated.
-     * @param offerType The type of offer (Lender or Borrower).
-     * @param asset The lending asset (ERC20/NFT contract).
-     * @param amount The amount (principal for ERC20, rental fee for NFT).
-     * @param interestRateBps The interest/rental rate in basis points.
-     * @param collateralAsset The collateral asset (ERC20 only for Phase 1).
-     * @param collateralAmount The collateral amount.
-     * @param durationDays The duration in days (min 1, max 365 for Phase 1).
-     * @param illiquidConsent Consent for illiquid assets (required if illiquid).
-     * @param tokenId Token ID for NFTs (0 for ERC20).
-     * @param quantity Quantity for ERC1155 (1 for ERC721, 0 for ERC20).
-     * @param assetType The asset type (ERC20, ERC721, ERC1155).
+     *      Callable by anyone when not paused.
+     * @param offerType Lender or Borrower.
+     * @param lendingAsset The lending asset address (ERC20 or NFT contract).
+     * @param amount Principal for ERC20; rental fee per day for NFT.
+     * @param interestRateBps Interest rate in basis points.
+     * @param collateralAsset Collateral asset address.
+     * @param collateralAmount Collateral amount.
+     * @param durationDays Loan duration in days.
+     * @param assetType Type of lending asset (ERC20, ERC721, ERC1155).
+     * @param tokenId Token ID for NFTs.
+     * @param quantity Quantity for ERC1155.
+     * @param illiquidConsent Consent for illiquid assets.
+     * @return offerId The ID of the created offer.
      */
     function createOffer(
         LibVangki.OfferType offerType,
-        address asset,
+        address lendingAsset,
         uint256 amount,
         uint256 interestRateBps,
         address collateralAsset,
         uint256 collateralAmount,
         uint256 durationDays,
-        bool illiquidConsent,
+        LibVangki.AssetType assetType,
         uint256 tokenId,
         uint256 quantity,
-        LibVangki.AssetType assetType
-    ) external nonReentrant whenNotPaused {
-        if (durationDays == 0 || durationDays > 365) revert InvalidDuration();
-        if (offerType == LibVangki.OfferType.Lender && amount == 0)
-            revert InvalidOfferType(); // Example validation
-        if (assetType == LibVangki.AssetType.ERC721 && quantity != 1)
-            revert InvalidAssetType();
-        if (
-            assetType == LibVangki.AssetType.ERC20 &&
-            (tokenId != 0 || quantity != 0)
-        ) revert InvalidAssetType();
+        bool illiquidConsent
+    ) external whenNotPaused returns (uint256 offerId) {
+        if (durationDays == 0) revert InvalidOfferType(); // Basic validation
 
         LibVangki.Storage storage s = LibVangki.storageSlot();
-        // New: Check country sanctions (assume userCountry set via ProfileFacet)
-        string memory creatorCountry = s.userCountry[msg.sender];
-        if (bytes(creatorCountry).length == 0) revert CountrySanctioned(); // Require registration
-
-        uint256 offerId;
         unchecked {
             offerId = ++s.nextOfferId;
-        } // Gas opt
+        }
 
         LibVangki.Offer storage offer = s.offers[offerId];
         offer.id = offerId;
         offer.creator = msg.sender;
         offer.offerType = offerType;
-        offer.lendingAsset = asset;
+        offer.lendingAsset = lendingAsset;
         offer.amount = amount;
         offer.interestRateBps = interestRateBps;
         offer.collateralAsset = collateralAsset;
         offer.collateralAmount = collateralAmount;
         offer.durationDays = durationDays;
+        offer.assetType = assetType;
         offer.tokenId = tokenId;
         offer.quantity = quantity;
-        offer.assetType = assetType;
+        offer.illiquidConsent = illiquidConsent;
 
-        // Determine liquidity via cross-facet staticcall
-        (bool success, bytes memory result) = address(this).staticcall(
-            abi.encodeWithSelector(OracleFacet.checkLiquidity.selector, asset)
-        );
-        if (!success) revert CrossFacetCallFailed("Liquidity check failed");
-        offer.liquidity = abi.decode(result, (LibVangki.LiquidityStatus));
+        // Check liquidity
+        LibVangki.LiquidityStatus liquidity = OracleFacet(address(this))
+            .checkLiquidity(lendingAsset);
+        offer.liquidity = liquidity;
 
-        if (
-            offer.liquidity != LibVangki.LiquidityStatus.Liquid &&
-            !illiquidConsent
-        ) revert IlliquidConsentRequired();
+        if (liquidity == LibVangki.LiquidityStatus.Illiquid && !illiquidConsent)
+            revert LiquidityMismatch();
 
-        // Lock assets in escrow via cross-facet call
+        // Get/create escrow
+        address escrow = getUserEscrow(msg.sender);
+
+        // Handle asset deposit/approval
+        bool success;
         if (offerType == LibVangki.OfferType.Lender) {
             if (assetType == LibVangki.AssetType.ERC20) {
-                IERC20(asset).safeTransferFrom(
+                IERC20(lendingAsset).safeTransferFrom(
                     msg.sender,
-                    address(this),
+                    escrow,
                     amount
                 );
-                (success, ) = address(this).call(
-                    abi.encodeWithSelector(
-                        EscrowFactoryFacet.escrowDepositERC20.selector,
-                        msg.sender,
-                        asset,
-                        amount
-                    )
-                );
             } else if (assetType == LibVangki.AssetType.ERC721) {
-                // For rentals: Approve escrow as operator (NFT stays with lender)
-                IERC721(asset).approve(
-                    getOrCreateUserEscrow(msg.sender),
-                    tokenId
-                );
-                // Validate rentable (try setUser to self and reset)
-                try
-                    IERC4907(asset).setUser(
-                        tokenId,
-                        msg.sender,
-                        uint64(block.timestamp + 1 days)
-                    )
-                {} catch {
-                    revert InvalidNFT();
-                }
-                IERC4907(asset).setUser(tokenId, address(0), 0); // Reset test
+                // Approve escrow as operator (NFT stays with lender)
+                IERC721(lendingAsset).approve(escrow, tokenId);
             } else if (assetType == LibVangki.AssetType.ERC1155) {
-                // Transfer to escrow
-                IERC1155(asset).safeTransferFrom(
+                // Deposit to escrow
+                IERC1155(lendingAsset).safeTransferFrom(
                     msg.sender,
-                    getOrCreateUserEscrow(msg.sender),
+                    escrow,
                     tokenId,
                     quantity,
                     ""
                 );
+            } else {
+                revert InvalidAssetType();
             }
-            if (!success) revert CrossFacetCallFailed("Deposit failed");
         } else {
-            // Borrower: Lock collateral (ERC20 only Phase 1)
-            IERC20(collateralAsset).safeTransferFrom(
-                msg.sender,
-                address(this),
-                collateralAmount
-            );
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowDepositERC20.selector,
+            // Borrower: Lock collateral
+            if (assetType == LibVangki.AssetType.ERC20) {
+                IERC20(collateralAsset).safeTransferFrom(
                     msg.sender,
-                    collateralAsset,
+                    escrow,
                     collateralAmount
-                )
-            );
-            if (!success) revert CrossFacetCallFailed("Deposit failed");
+                );
+            } else if (assetType == LibVangki.AssetType.ERC721) {
+                IERC721(collateralAsset).safeTransferFrom(
+                    msg.sender,
+                    escrow,
+                    tokenId
+                );
+            } else if (assetType == LibVangki.AssetType.ERC1155) {
+                IERC1155(collateralAsset).safeTransferFrom(
+                    msg.sender,
+                    escrow,
+                    tokenId,
+                    quantity,
+                    ""
+                );
+            } else {
+                revert InvalidAssetType();
+            }
         }
 
-        // Mint NFT for creator via cross-facet call
-        (success, result) = address(this).call(
+        // Mint NFT for offer
+        unchecked {
+            offer.tokenId = ++s.nextTokenId;
+        }
+        (success, ) = address(this).call(
             abi.encodeWithSelector(
                 VangkiNFTFacet.mintNFT.selector,
                 msg.sender,
-                offerId,
-                true // isCreator
+                offer.tokenId,
+                offerType == LibVangki.OfferType.Lender ? "Lender" : "Borrower"
             )
         );
-        if (!success) revert CrossFacetCallFailed("Mint failed");
+        if (!success) revert CrossFacetCallFailed("Mint NFT failed");
 
         emit OfferCreated(offerId, msg.sender, offerType);
     }
 
     /**
-     * @notice Accepts an existing offer, initiating a loan.
-     * @dev Transfers assets, mints acceptor NFT, initiates loan via LoanFacet.
-     *      Enhanced: Handles NFT rentals (setUser on accept).
-     *      Checks country match for sanctions (creator vs acceptor).
-     *      Reverts if paused, own offer, or sanctioned.
-     *      New Illiquid Handling: Calculates transaction value (liquid lent + collateral in USD); if > $2k, requires KYC for both.
-     *      For NFT rentals, value = amount * durationDays if liquid (but NFTs illiquid, $0).
+     * @notice Accepts an existing offer.
+     * @dev Matches Lender/Borrower, initiates loan via LoanFacet.
+     *      Transfers assets from escrows.
+     *      Enhanced: For NFT lending, locks prepay (amount * durationDays + 5% buffer) from borrower,
+     *      sets renter via escrowSetNFTUser. Daily deduct pro-rata from prepay on repay (in RepayFacet).
+     *      Adds KYC check if transaction value > $2k USD (liquid parts only).
+     *      Checks countries compatible (placeholder: not equal to sanctioned; expand with mapping).
+     *      Updates NFTs to active loan status.
+     *      Reverts if paused, incompatible countries, or KYC required.
      *      Emits OfferAccepted.
-     * @param offerId The ID of the offer to accept.
+     *      Callable by anyone when not paused.
+     * @param offerId The offer ID to accept.
+     * @return loanId The ID of the initiated loan.
      */
-    function acceptOffer(uint256 offerId) external nonReentrant whenNotPaused {
+    function acceptOffer(
+        uint256 offerId
+    ) external whenNotPaused returns (uint256 loanId) {
         LibVangki.Storage storage s = LibVangki.storageSlot();
         LibVangki.Offer storage offer = s.offers[offerId];
         if (offer.accepted) revert OfferAlreadyAccepted();
-        if (offer.creator == msg.sender) revert CannotAcceptOwnOffer();
 
-        // New: Sanctions check
-        string memory acceptorCountry = s.userCountry[msg.sender];
-        string memory creatorCountry = s.userCountry[offer.creator];
-        if (
-            keccak256(bytes(acceptorCountry)) !=
-            keccak256(bytes(creatorCountry))
-        ) revert CountrySanctioned(); // Simple match; expand for sanction lists
+        // Check countries compatible
+        string memory creatorCountry = ProfileFacet(address(this))
+            .getUserCountry(offer.creator);
+        string memory acceptorCountry = ProfileFacet(address(this))
+            .getUserCountry(msg.sender);
+        if (!canTradeBetween(creatorCountry, acceptorCountry))
+            revert CountriesNotCompatible(); // Placeholder func
 
-        // New Illiquid Handling: Calculate transaction value for KYC (liquid parts in USD)
-        uint256 transactionValueUSD = _calculateTransactionValueUSD(offer);
-        if (transactionValueUSD > KYC_THRESHOLD_USD) {
+        // Calculate transaction value for KYC
+        uint256 valueUSD = _calculateTransactionValueUSD(offer);
+        if (valueUSD > KYC_THRESHOLD_USD) {
             if (
                 !ProfileFacet(address(this)).isKYCVerified(offer.creator) ||
                 !ProfileFacet(address(this)).isKYCVerified(msg.sender)
-            ) revert KYCRequiredForHighValue();
+            ) {
+                revert KYCRequired();
+            }
+        }
+
+        address lenderEscrow;
+        address borrowerEscrow;
+        address lender;
+        address borrower;
+
+        if (offer.offerType == LibVangki.OfferType.Lender) {
+            lender = offer.creator;
+            borrower = msg.sender;
+            lenderEscrow = getUserEscrow(lender);
+            borrowerEscrow = getUserEscrow(borrower);
+        } else {
+            lender = msg.sender;
+            borrower = offer.creator;
+            lenderEscrow = getUserEscrow(lender);
+            borrowerEscrow = getUserEscrow(borrower);
         }
 
         bool success;
-        if (offer.offerType == LibVangki.OfferType.Lender) {
-            // Acceptor is borrower: Lock collateral
-            IERC20(offer.collateralAsset).safeTransferFrom(
-                msg.sender,
-                address(this),
-                offer.collateralAmount
-            );
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowDepositERC20.selector,
-                    msg.sender,
-                    offer.collateralAsset,
-                    offer.collateralAmount
-                )
-            );
-            if (!success) revert CrossFacetCallFailed("Collateral lock failed");
-
+        if (offer.assetType == LibVangki.AssetType.ERC20) {
             // Transfer principal to borrower
             (success, ) = address(this).call(
                 abi.encodeWithSelector(
                     EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                    offer.creator,
+                    lender,
                     offer.lendingAsset,
-                    msg.sender,
+                    borrower,
                     offer.amount
                 )
             );
             if (!success)
                 revert CrossFacetCallFailed("Principal transfer failed");
-
-            // If NFT lending: Set renter (borrower)
-            if (offer.assetType != LibVangki.AssetType.ERC20) {
-                uint64 expires = uint64(
-                    block.timestamp + offer.durationDays * 1 days
-                );
-                (success, ) = address(this).call(
-                    abi.encodeWithSelector(
-                        EscrowFactoryFacet.setNFTUser.selector,
-                        offer.creator,
-                        offer.lendingAsset,
-                        offer.tokenId,
-                        msg.sender,
-                        expires
-                    )
-                );
-                if (!success) revert CrossFacetCallFailed("Set renter failed");
-            }
         } else {
-            // Acceptor is lender: Lock principal
+            // NFT renting: Borrower prepays (fee * days + 5% buffer)
+            uint256 prepayAmount = offer.amount * offer.durationDays;
+            uint256 buffer = (prepayAmount * RENTAL_BUFFER_BPS) / BASIS_POINTS;
+            uint256 totalPrepay = prepayAmount + buffer;
+            IERC20(offer.collateralAsset).safeTransferFrom( // Assume collateralAsset is payment token; adjust if separate
+                borrower,
+                borrowerEscrow,
+                totalPrepay
+            );
+
+            // Set renter (borrower as user)
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowSetNFTUser.selector,
+                    lender,
+                    offer.lendingAsset,
+                    offer.tokenId,
+                    borrower,
+                    uint64(block.timestamp + offer.durationDays * 1 days)
+                )
+            );
+            if (!success) revert CrossFacetCallFailed("Set renter failed");
+        }
+
+        // Lock collateral from borrower (already in escrow for Borrower offers)
+        if (offer.offerType == LibVangki.OfferType.Lender) {
             if (offer.assetType == LibVangki.AssetType.ERC20) {
-                IERC20(offer.lendingAsset).safeTransferFrom(
-                    msg.sender,
-                    address(this),
-                    offer.amount
-                );
-                (success, ) = address(this).call(
-                    abi.encodeWithSelector(
-                        EscrowFactoryFacet.escrowDepositERC20.selector,
-                        msg.sender,
-                        offer.lendingAsset,
-                        offer.amount
-                    )
+                IERC20(offer.collateralAsset).safeTransferFrom(
+                    borrower,
+                    borrowerEscrow,
+                    offer.collateralAmount
                 );
             } else if (offer.assetType == LibVangki.AssetType.ERC721) {
-                IERC721(offer.lendingAsset).approve(
-                    getOrCreateUserEscrow(msg.sender),
+                IERC721(offer.collateralAsset).safeTransferFrom(
+                    borrower,
+                    borrowerEscrow,
                     offer.tokenId
                 );
             } else if (offer.assetType == LibVangki.AssetType.ERC1155) {
-                IERC1155(offer.lendingAsset).safeTransferFrom(
-                    msg.sender,
-                    getOrCreateUserEscrow(msg.sender),
+                IERC1155(offer.collateralAsset).safeTransferFrom(
+                    borrower,
+                    borrowerEscrow,
                     offer.tokenId,
                     offer.quantity,
                     ""
                 );
             }
-            if (!success) revert CrossFacetCallFailed("Principal lock failed");
-
-            // Transfer collateral to lender? No, collateral from borrower offer is released to acceptor? Specs: For borrower offer, acceptor (lender) locks principal, borrower gets principal, collateral locked.
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                    offer.creator,
-                    offer.collateralAsset,
-                    offer.creator,
-                    offer.collateralAmount // Release to borrower? Specs clarify
-                )
-            );
-            if (!success)
-                revert CrossFacetCallFailed("Collateral release failed");
-
-            // Transfer principal to borrower (creator)
-            if (offer.assetType == LibVangki.AssetType.ERC20) {
-                (success, ) = address(this).call(
-                    abi.encodeWithSelector(
-                        EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                        msg.sender,
-                        offer.lendingAsset,
-                        offer.creator,
-                        offer.amount
-                    )
-                );
-            } // For NFTs: Set user as above
-            if (!success)
-                revert CrossFacetCallFailed("Principal transfer failed");
         }
 
-        offer.accepted = true;
-
-        // Mint NFT for acceptor
-        (success, ) = address(this).call(
-            abi.encodeWithSelector(
-                VangkiNFTFacet.mintNFT.selector,
-                msg.sender,
-                offerId,
-                false // Not creator
-            )
-        );
-        if (!success) revert CrossFacetCallFailed("Mint failed");
-
-        // Initiate loan via LoanFacet
-        bytes memory loanResult;
-        (success, loanResult) = address(this).call(
+        // Initiate loan
+        bytes memory result;
+        (success, result) = address(this).call(
             abi.encodeWithSelector(
                 LoanFacet.initiateLoan.selector,
                 offerId,
-                msg.sender // Acceptor
+                msg.sender
             )
         );
-        if (!success) revert CrossFacetCallFailed("Loan init failed");
-        uint256 loanId = abi.decode(loanResult, (uint256));
+        if (!success) revert CrossFacetCallFailed("Loan initiation failed");
+        loanId = abi.decode(result, (uint256));
 
-        emit OfferAccepted(offerId, loanId);
+        // Update offer
+        offer.accepted = true;
+
+        // Update NFTs to loan active (cross-facet)
+        (success, ) = address(this).call(
+            abi.encodeWithSelector(
+                VangkiNFTFacet.updateNFTStatus.selector,
+                offer.tokenId,
+                "Loan Active"
+            )
+        );
+        if (!success) revert CrossFacetCallFailed("NFT update failed");
+
+        emit OfferAccepted(offerId, msg.sender, loanId);
     }
 
     /**
-     * @notice Cancels an existing offer if not accepted.
-     * @dev Releases locked assets from escrow.
-     *      Enhanced: Handles NFT revokes/resets.
-     *      Reverts if paused or not creator.
-     *      Emits OfferCancelled.
-     * @param offerId The ID of the offer to cancel.
+     * @notice Cancels an existing offer.
+     * @dev Releases assets from escrow.
+     *      For NFT: Revokes approval or withdraws.
+     *      Burns NFT.
+     *      Reverts if accepted or not creator.
+     *      Emits OfferCanceled.
+     * @param offerId The offer ID to cancel.
      */
-    function cancelOffer(uint256 offerId) external nonReentrant whenNotPaused {
+    function cancelOffer(uint256 offerId) external whenNotPaused {
         LibVangki.Storage storage s = LibVangki.storageSlot();
         LibVangki.Offer storage offer = s.offers[offerId];
         if (offer.creator != msg.sender) revert NotOfferCreator();
         if (offer.accepted) revert OfferAlreadyAccepted();
+
+        address escrow = getUserEscrow(msg.sender);
 
         bool success;
         if (offer.offerType == LibVangki.OfferType.Lender) {
@@ -426,6 +399,7 @@ contract OfferFacet is ReentrancyGuard, Pausable {
                         offer.amount
                     )
                 );
+                if (!success) revert CrossFacetCallFailed("Withdraw failed");
             } else if (offer.assetType == LibVangki.AssetType.ERC721) {
                 // Revoke approval
                 IERC721(offer.lendingAsset).approve(address(0), offer.tokenId);
@@ -440,59 +414,170 @@ contract OfferFacet is ReentrancyGuard, Pausable {
                         msg.sender
                     )
                 );
+                if (!success) revert CrossFacetCallFailed("Withdraw failed");
             }
-            if (!success) revert CrossFacetCallFailed("Withdraw failed");
         } else {
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                    msg.sender,
-                    offer.collateralAsset,
-                    msg.sender,
-                    offer.collateralAmount
-                )
-            );
-            if (!success) revert CrossFacetCallFailed("Withdraw failed");
+            // Borrower: Unlock collateral
+            if (offer.assetType == LibVangki.AssetType.ERC20) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                        msg.sender,
+                        offer.collateralAsset,
+                        msg.sender,
+                        offer.collateralAmount
+                    )
+                );
+                if (!success) revert CrossFacetCallFailed("Unlock failed");
+            } else if (offer.assetType == LibVangki.AssetType.ERC721) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC721.selector,
+                        msg.sender,
+                        offer.collateralAsset,
+                        offer.tokenId,
+                        msg.sender
+                    )
+                );
+                if (!success) revert CrossFacetCallFailed("Unlock failed");
+            } else if (offer.assetType == LibVangki.AssetType.ERC1155) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC1155.selector,
+                        msg.sender,
+                        offer.collateralAsset,
+                        offer.tokenId,
+                        offer.quantity,
+                        msg.sender
+                    )
+                );
+                if (!success) revert CrossFacetCallFailed("Unlock failed");
+            }
         }
 
+        // Burn NFT
+        (success, ) = address(this).call(
+            abi.encodeWithSelector(
+                VangkiNFTFacet.burnNFT.selector,
+                offer.tokenId
+            )
+        );
+        if (!success) revert CrossFacetCallFailed("Burn NFT failed");
+
         delete s.offers[offerId];
-        emit OfferCancelled(offerId);
+
+        emit OfferCanceled(offerId, msg.sender);
     }
 
-    // Internal helper for generating tokenURI (basic placeholder; expand with IPFS/base64 JSON)
-    /// @dev Generates a dynamic tokenURI string (e.g., JSON metadata with status and role).
-    ///      Currently a stub; implement base64 encoding for on-chain metadata or IPFS links.
-    function _generateTokenURI(
-        uint256 offerId,
-        bool isCreator,
-        bool isClosed
-    ) internal pure returns (string memory) {
-        // Example: return string(abi.encodePacked("ipfs://Qm...", "/metadata.json?offer=", offerId));
-        // Or dynamic: Use base64 library if added, or off-chain pointer.
-        return
-            string(
-                abi.encodePacked(
-                    'data:application/json,{"offerId":',
-                    offerId.toString(),
-                    '","role":"',
-                    isCreator ? '"creator"' : '"acceptor"',
-                    '","status":"',
-                    isClosed ? '"closed"' : '"active"',
-                    '"}'
-                )
-            );
+    /**
+     * @notice Gets compatible offers for a user based on country sanctions.
+     * @dev Filters active offers where creator's country can trade with user's.
+     *      Placeholder: Simple keccak256 hash comparison for "US" vs. sanctioned list.
+     *      Expand in Phase 2 with governance-updatable allowed pairs.
+     *      View function.
+     * @param user The user address.
+     * @return offerIds Array of compatible offer IDs.
+     */
+    function getCompatibleOffers(
+        address user
+    ) external view returns (uint256[] memory offerIds) {
+        LibVangki.Storage storage s = LibVangki.storageSlot();
+        string memory userCountry = ProfileFacet(address(this)).getUserCountry(
+            user
+        );
+
+        uint256 count;
+        for (uint256 i = 1; i <= s.nextOfferId; i++) {
+            LibVangki.Offer storage offer = s.offers[i];
+            if (!offer.accepted) {
+                string memory creatorCountry = ProfileFacet(address(this))
+                    .getUserCountry(offer.creator);
+                if (canTradeBetween(userCountry, creatorCountry)) {
+                    count++;
+                }
+            }
+        }
+
+        offerIds = new uint256[](count);
+        uint256 index;
+        for (uint256 i = 1; i <= s.nextOfferId; i++) {
+            LibVangki.Offer storage offer = s.offers[i];
+            if (!offer.accepted) {
+                string memory creatorCountry = ProfileFacet(address(this))
+                    .getUserCountry(offer.creator);
+                if (canTradeBetween(userCountry, creatorCountry)) {
+                    offerIds[index++] = i;
+                }
+            }
+        }
     }
 
-    // Helper to get/create escrow (from EscrowFactoryFacet)
-    function getOrCreateUserEscrow(address user) internal returns (address) {
-        (bool success, bytes memory result) = address(this).call(
+    // Internal helpers
+
+    /**
+     * @notice Gets or creates a user's escrow proxy.
+     * @dev Deploys a new ERC1967Proxy if none exists, pointing to the shared implementation.
+     *      View function if exists; mutates if creates.
+     *      Emits UserEscrowCreated on creation.
+     * @param user The user address.
+     * @return proxy The user's escrow proxy address.
+     */
+    function getUserEscrow(address user) public returns (address proxy) {
+        bool success;
+        bytes memory result;
+        (success, result) = address(this).call(
             abi.encodeWithSelector(
                 EscrowFactoryFacet.getOrCreateUserEscrow.selector,
                 user
             )
         );
-        if (!success) revert CrossFacetCallFailed("Escrow creation failed");
-        return abi.decode(result, (address));
+        if (!success) revert GetUserEscrowFailed("Get User Escrow failed");
+        proxy = abi.decode(result, (address));
+        return (proxy);
+    }
+
+    /// @dev Placeholder for country trade compatibility (e.g., not US-IR, etc.).
+    ///      Expand with mapping(string => mapping(string => bool)) allowedTrades in LibVangki.
+    function canTradeBetween(
+        string memory countryA,
+        string memory countryB
+    ) internal pure returns (bool) {
+        bytes32 hashA = keccak256(bytes(countryA));
+        bytes32 hashB = keccak256(bytes(countryB));
+        bytes32 sanctionedHash = keccak256(bytes("IR")); // Example: Sanctioned "IR"
+        return hashA != sanctionedHash && hashB != sanctionedHash; // Simple; enhance as needed
+    }
+
+    /// @dev Simulates LTV with temp collateral (borrowUSD * 10000 / collateralUSD).
+    function _simulateLTV(
+        LibVangki.Loan storage loan,
+        uint256 tempCollateral
+    ) internal view returns (uint256) {
+        uint256 currentBorrowBalance = _calculateCurrentBorrowBalance(loan);
+        (uint256 borrowPrice, uint8 borrowDecimals) = OracleFacet(address(this))
+            .getAssetPrice(loan.principalAsset);
+        uint256 borrowedValueUSD = (currentBorrowBalance * borrowPrice) /
+            (10 ** borrowDecimals);
+
+        (uint256 collateralPrice, uint8 collateralDecimals) = OracleFacet(
+            address(this)
+        ).getAssetPrice(loan.collateralAsset);
+        uint256 collateralValueUSD = (tempCollateral * collateralPrice) /
+            (10 ** collateralDecimals);
+        if (collateralValueUSD == 0) return type(uint256).max; // Infinite LTV
+
+        return (borrowedValueUSD * BASIS_POINTS) / collateralValueUSD;
+    }
+
+    // Internal helper for current borrow balance with accrued interest
+    function _calculateCurrentBorrowBalance(
+        LibVangki.Loan storage loan
+    ) internal view returns (uint256) {
+        uint256 elapsed = block.timestamp - loan.startTime;
+        uint256 accruedInterest = (loan.principal *
+            loan.interestRateBps *
+            (elapsed / 1 days)) / (365 * BASIS_POINTS);
+        return loan.principal + accruedInterest;
     }
 
     // New Internal: Calculate transaction value in USD for KYC (liquid parts only)

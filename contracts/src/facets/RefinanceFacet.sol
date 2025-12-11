@@ -55,6 +55,7 @@ contract RefinanceFacet is ReentrancyGuard {
 
     // Constants (configurable via governance in Phase 2)
     uint256 private constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
+    uint256 private constant BASIS_POINTS = 10000;
 
     // Assume treasury address (add to LibVangki.Storage as address treasury;)
     // For now, hardcoded as immutable; make configurable.
@@ -100,19 +101,18 @@ contract RefinanceFacet is ReentrancyGuard {
         // Repay old loan using new principal (transfer to old lender)
         uint256 oldInterest = RepayFacet(address(this))
             .calculateRepaymentAmount(oldLoanId) - oldLoan.principal; // Interest + late
-        IERC20(oldLoan.principalAsset).safeTransferFrom(
-            msg.sender,
+        IERC20(oldLoan.principalAsset).safeTransfer(
             oldLoan.lender,
             oldLoan.principal + oldInterest
-        ); // Specs: Borrower may pay shortfall
+        ); // Specs: Borrower may pay shortfall if needed, but here use new principal
 
         // Handle shortfall if new offer interest lower (full-term comparison)
         uint256 oldExpectedInterest = (oldLoan.principal *
             oldLoan.interestRateBps *
-            oldLoan.durationDays) / (365 * 10000);
+            oldLoan.durationDays) / (365 * BASIS_POINTS);
         uint256 newExpectedInterest = (newOffer.amount *
             newOffer.interestRateBps *
-            newOffer.durationDays) / (365 * 10000);
+            newOffer.durationDays) / (365 * BASIS_POINTS);
         uint256 shortfall = 0;
         if (newExpectedInterest < oldExpectedInterest) {
             shortfall = oldExpectedInterest - newExpectedInterest;
@@ -145,7 +145,7 @@ contract RefinanceFacet is ReentrancyGuard {
         );
         if (!success) revert CrossFacetCallFailed("Collateral deposit failed");
 
-        // New: Check post-refinance HF >= min
+        // Check post-refinance HF >= min
         (success, result) = address(this).staticcall(
             abi.encodeWithSelector(
                 RiskFacet.calculateHealthFactor.selector,
@@ -156,7 +156,7 @@ contract RefinanceFacet is ReentrancyGuard {
         uint256 newHF = abi.decode(result, (uint256));
         if (newHF < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
 
-        // New: Check post-refinance LTV <= maxLtvBps
+        // Check post-refinance LTV <= maxLtvBps
         (success, result) = address(this).staticcall(
             abi.encodeWithSelector(RiskFacet.calculateLTV.selector, newLoanId)
         );
@@ -191,9 +191,17 @@ contract RefinanceFacet is ReentrancyGuard {
     }
 
     // Internal helpers
+    /**
+     * @dev Transfers amount to treasury and updates balance (if needed for fees).
+     * @param asset The ERC-20 asset.
+     * @param amount The amount to transfer.
+     */
     function _transferToTreasury(address asset, uint256 amount) internal {
+        if (amount == 0) return;
         LibVangki.Storage storage s = LibVangki.storageSlot();
-        s.treasuryBalances[asset] += amount;
+        unchecked {
+            s.treasuryBalances[asset] += amount;
+        }
         IERC20(asset).safeTransfer(TREASURY, amount);
     }
 }

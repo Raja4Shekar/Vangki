@@ -12,6 +12,7 @@ import {OracleFacet} from "./OracleFacet.sol"; // For liquidity and USD value
 import {VangkiNFTFacet} from "./VangkiNFTFacet.sol"; // For updates
 import {EscrowFactoryFacet} from "./EscrowFactoryFacet.sol"; // For transfers
 import {ProfileFacet} from "./ProfileFacet.sol"; // Added for KYC check
+import {RiskFacet} from "./RiskFacet.sol";
 
 /**
  * @title DefaultedFacet
@@ -22,6 +23,8 @@ import {ProfileFacet} from "./ProfileFacet.sol"; // Added for KYC check
  *      For liquid: 0x swap; illiquid: full transfer.
  *      Custom errors, ReentrancyGuard, events.
  *      Expand for Phase 2.
+ *      Enhanced for NFT defaults: Transfers prepay to lender, buffer to treasury (assumes prepay in ERC-20 held in borrower escrow).
+ *      Resets renter to address(0).
  */
 contract DefaultedFacet is ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -55,34 +58,27 @@ contract DefaultedFacet is ReentrancyGuard, Pausable {
 
     // Assume treasury (hardcoded; move to LibVangki)
     address private immutable TREASURY =
-        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA);
+        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
 
     // Constants
     uint256 private constant BASIS_POINTS = 10000;
-    uint256 private constant LIQ_TREASURY_FEE_BPS = 0; // 0% Phase 1; configurable in Phase 2
-    uint256 private constant KYC_THRESHOLD_USD = 2000 * 1e18; // $2k, assuming 18 decimals for USD
+    uint256 private constant KYC_THRESHOLD_USD = 2000 * 1e18; // Scaled to 1e18
 
     /**
-     * @notice Triggers default on a loan past grace period.
-     * @dev Callable by lender when not paused. Transfers full collateral (illiquid) or liquidates via 0x (liquid).
-     *      Enhanced: Checks KYC if proceeds > $2k USD (via Oracle), deducts treasury fee on proceeds.
-     *      No HF check (separated to RiskFacet.triggerLiquidation).
-     *      Updates status to Defaulted, burns NFTs after update.
-     *      For NFT lending: Lender claims NFT, resets renter.
-     *      Emits LoanDefaulted and LoanLiquidated (if applicable).
-     *      Frontend provides fillData/minOutputAmount from 0x quote.
+     * @notice Triggers default for a loan past grace period (permissionless).
+     * @dev If liquid collateral: Calls triggerLiquidation (0x swap).
+     *      If illiquid: Transfers full collateral to lender.
+     *      Enhanced for NFTs: Transfers prepay (amount * durationDays) to lender, buffer (5%) to treasury from borrower escrow.
+     *      Resets renter via escrowSetNFTUser(address(0), 0).
+     *      Updates loan to Defaulted, burns NFTs.
+     *      Emits LoanDefaulted.
      * @param loanId The loan ID to default.
-     * @param fillData The 0x fill quote data (calldata for swap; empty for illiquid).
-     * @param minOutputAmount The minimum output amount for swap (slippage protection; 0 for illiquid).
      */
     function triggerDefault(
-        uint256 loanId,
-        bytes calldata fillData,
-        uint256 minOutputAmount
-    ) external nonReentrant whenNotPaused {
+        uint256 loanId
+    ) external whenNotPaused nonReentrant {
         LibVangki.Storage storage s = LibVangki.storageSlot();
         LibVangki.Loan storage loan = s.loans[loanId];
-        if (loan.lender != msg.sender) revert NotLender();
         if (loan.status != LibVangki.LoanStatus.Active)
             revert InvalidLoanStatus();
 
@@ -90,114 +86,67 @@ contract DefaultedFacet is ReentrancyGuard, Pausable {
         uint256 graceEnd = endTime + LibVangki.gracePeriod(loan.durationDays);
         if (block.timestamp <= graceEnd) revert NotDefaultedYet();
 
-        // Determine liquidity via cross-facet staticcall
-        (bool liqSuccess, bytes memory liqResult) = address(this).staticcall(
-            abi.encodeWithSelector(
-                OracleFacet.checkLiquidity.selector,
-                loan.collateralAsset
-            )
-        );
-        if (!liqSuccess) revert CrossFacetCallFailed("Liquidity check failed");
-        LibVangki.LiquidityStatus liquidity = abi.decode(
-            liqResult,
-            (LibVangki.LiquidityStatus)
-        );
-
-        uint256 proceeds = 0;
         bool success;
+        LibVangki.LiquidityStatus liquidity = OracleFacet(address(this))
+            .checkLiquidity(loan.collateralAsset);
+
         if (liquidity == LibVangki.LiquidityStatus.Liquid) {
-            // Liquid: Withdraw collateral to Diamond, approve 0x, execute swap
+            // Liquid: Trigger liquidation (permissionless)
             (success, ) = address(this).call(
                 abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                    loan.borrower,
-                    loan.collateralAsset,
-                    address(this),
-                    loan.collateralAmount
+                    RiskFacet.triggerLiquidation.selector,
+                    loanId
                 )
             );
-            if (!success)
-                revert CrossFacetCallFailed("Collateral withdraw failed");
-
-            IERC20(loan.collateralAsset).forceApprove(
-                ZERO_EX_PROXY,
-                loan.collateralAmount
-            );
-
-            // Execute 0x fill (assume fillData targets swap to principalAsset)
-            (bool swapSuccess, bytes memory swapResult) = ZERO_EX_PROXY.call(
-                fillData
-            );
-            if (!swapSuccess) {
-                // Enhanced error handling: Decode revert reason if possible
-                if (swapResult.length > 0) {
-                    assembly {
-                        revert(add(swapResult, 0x20), mload(swapResult))
-                    }
-                } else {
-                    revert LiquidationFailed();
-                }
-            }
-            proceeds = abi.decode(swapResult, (uint256));
-
-            if (proceeds < minOutputAmount) revert InsufficientProceeds();
-
-            // Deduct treasury fee on proceeds (0% Phase 1)
-            uint256 treasuryFee = (proceeds * LIQ_TREASURY_FEE_BPS) /
-                BASIS_POINTS;
-            s.treasuryBalances[loan.principalAsset] += treasuryFee;
-            IERC20(loan.principalAsset).safeTransfer(TREASURY, treasuryFee);
-
-            // Check KYC if proceeds - fee > $2k USD
-            uint256 netProceeds = proceeds - treasuryFee;
-            (bool priceSuccess, bytes memory priceResult) = address(this)
-                .staticcall(
-                    abi.encodeWithSelector(
-                        OracleFacet.getAssetPrice.selector,
-                        loan.principalAsset
-                    )
-                );
-            if (priceSuccess) {
-                (uint256 price, uint8 decimals) = abi.decode(
-                    priceResult,
-                    (uint256, uint8)
-                );
-                uint256 proceedsUSD = (netProceeds * price) / (10 ** decimals);
-                if (proceedsUSD > KYC_THRESHOLD_USD) {
-                    (bool kycSuccess, bytes memory kycResult) = address(this)
-                        .staticcall(
-                            abi.encodeWithSelector(
-                                ProfileFacet.isKYCVerified.selector,
-                                msg.sender
-                            )
-                        );
-                    if (!kycSuccess || !abi.decode(kycResult, (bool)))
-                        revert KYCRequired();
-                }
-            } // Ignore if price fail (non-liquid shouldn't reach here)
-
-            IERC20(loan.principalAsset).safeTransfer(loan.lender, netProceeds);
-
-            emit LoanLiquidated(loanId, proceeds, treasuryFee);
+            if (!success) revert CrossFacetCallFailed("Liquidation failed");
         } else {
             // Illiquid: Full collateral to lender
-            (success, ) = address(this).call(
-                abi.encodeWithSelector(
-                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
-                    loan.borrower,
-                    loan.collateralAsset,
-                    loan.lender,
-                    loan.collateralAmount
-                )
-            );
-            if (!success) revert CrossFacetCallFailed("Full transfer failed");
+            if (loan.assetType == LibVangki.AssetType.ERC20) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                        loan.borrower,
+                        loan.collateralAsset,
+                        loan.lender,
+                        loan.collateralAmount
+                    )
+                );
+                if (!success)
+                    revert CrossFacetCallFailed("Collateral transfer failed");
+            } else if (loan.assetType == LibVangki.AssetType.ERC721) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC721.selector,
+                        loan.borrower,
+                        loan.collateralAsset,
+                        loan.tokenId,
+                        loan.lender
+                    )
+                );
+                if (!success)
+                    revert CrossFacetCallFailed("NFT transfer failed");
+            } else if (loan.assetType == LibVangki.AssetType.ERC1155) {
+                (success, ) = address(this).call(
+                    abi.encodeWithSelector(
+                        EscrowFactoryFacet.escrowWithdrawERC1155.selector,
+                        loan.borrower,
+                        loan.collateralAsset,
+                        loan.tokenId,
+                        loan.quantity,
+                        loan.lender
+                    )
+                );
+                if (!success)
+                    revert CrossFacetCallFailed("NFT transfer failed");
+            }
         }
 
-        // For NFT lending: Reset renter and claim if needed
+        // NFT-specific handling (if lendingAsset is NFT)
         if (loan.assetType != LibVangki.AssetType.ERC20) {
+            // Reset renter
             (success, ) = address(this).call(
                 abi.encodeWithSelector(
-                    EscrowFactoryFacet.setNFTUser.selector,
+                    EscrowFactoryFacet.escrowSetNFTUser.selector,
                     loan.lender,
                     loan.principalAsset,
                     loan.tokenId,
@@ -220,6 +169,33 @@ contract DefaultedFacet is ReentrancyGuard, Pausable {
                 );
                 if (!success) revert CrossFacetCallFailed("NFT claim failed");
             }
+
+            // Handle prepay: Assume prepayAsset = collateralAsset (ERC-20), prepayAmount = amount * durationDays + buffer
+            // Note: Assume added fields in Loan: uint256 prepayAmount, uint256 bufferAmount (set in acceptOffer)
+            uint256 prepayToLender = loan.prepayAmount - loan.bufferAmount;
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                    loan.borrower,
+                    loan.collateralAsset, // Assume prepay in collateralAsset
+                    loan.lender,
+                    prepayToLender
+                )
+            );
+            if (!success) revert CrossFacetCallFailed("Prepay transfer failed");
+
+            // Buffer to treasury
+            (success, ) = address(this).call(
+                abi.encodeWithSelector(
+                    EscrowFactoryFacet.escrowWithdrawERC20.selector,
+                    loan.borrower,
+                    loan.collateralAsset,
+                    TREASURY,
+                    loan.bufferAmount
+                )
+            );
+            if (!success)
+                revert CrossFacetCallFailed("Buffer to treasury failed");
         }
 
         loan.status = LibVangki.LoanStatus.Defaulted;

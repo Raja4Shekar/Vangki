@@ -48,6 +48,7 @@ contract EscrowFactoryFacet {
     error AlreadyInitialized();
     error UpgradeFailed();
     error ProxyCallFailed(string reason);
+    error NoEscrow();
 
     /**
      * @notice Initializes the shared escrow implementation by deploying a new VangkiEscrowImplementation.
@@ -295,24 +296,30 @@ contract EscrowFactoryFacet {
 
     /**
      * @notice Sets the temporary user (renter) for a rentable NFT from the specified user's escrow.
-     * @dev Low-level call to the proxy's setNFTUser function (IERC4907.setUser).
-     *      Reverts on failure.
-     *      Callable by facets (e.g., for loan acceptance).
-     * @param user The user whose escrow to operate from (lender).
-     * @param nftContract The NFT contract address.
+     * @dev Low-level call to the proxy's setUser function (IERC4907.setUser).
+     *      Enhanced: Explicit proxy existence check. Reverts with reason on failure.
+     *      For ERC721: Calls as operator (NFT not held in escrow).
+     *      For ERC1155: Calls while holding tokens in escrow (assumes IERC4907 support).
+     *      Reverts on failure (e.g., if NFT doesn't support IERC4907).
+     *      Callable by facets (e.g., for loan acceptance in OfferFacet).
+     * @param user The user whose escrow to operate from (typically the lender).
+     * @param nftContract The NFT contract address (must support IERC4907).
      * @param tokenId The token ID.
-     * @param renter The temporary renter address.
-     * @param expires The expiration timestamp.
+     * @param renter The temporary renter address (borrower).
+     * @param expires The expiration timestamp (end of loan term).
      */
-    function setNFTUser(
+    function escrowSetNFTUser(
         address user,
         address nftContract,
         uint256 tokenId,
         address renter,
         uint64 expires
     ) external {
-        address proxy = getOrCreateUserEscrow(user);
-        (bool success, ) = proxy.call(
+        LibVangki.Storage storage s = LibVangki.storageSlot();
+        address proxy = s.userVangkiEscrows[user];
+        if (proxy == address(0)) revert NoEscrow();
+
+        (bool success, bytes memory returnData) = proxy.call(
             abi.encodeWithSelector(
                 VangkiEscrowImplementation.setUser.selector,
                 nftContract,
@@ -321,12 +328,22 @@ contract EscrowFactoryFacet {
                 expires
             )
         );
-        if (!success) revert ProxyCallFailed("Set NFT user failed");
+        if (!success) {
+            // Decode revert reason if available
+            if (returnData.length > 0) {
+                assembly {
+                    let returndata_size := mload(returnData)
+                    revert(add(32, returnData), returndata_size)
+                }
+            } else {
+                revert ProxyCallFailed("Set NFT user failed");
+            }
+        }
     }
 
     /**
      * @notice Gets the current user of a rentable NFT from the specified user's escrow.
-     * @dev Low-level staticcall to the proxy's getNFTUserOf function.
+     * @dev Low-level staticcall to the proxy's userOf function.
      *      Returns zero address on failure.
      *      View function; callable by anyone.
      * @param user The user whose escrow to query.
@@ -356,7 +373,7 @@ contract EscrowFactoryFacet {
 
     /**
      * @notice Gets the expiration timestamp for a rentable NFT's user from the specified user's escrow.
-     * @dev Low-level staticcall to the proxy's getNFTUserExpires function.
+     * @dev Low-level staticcall to the proxy's userExpires function.
      *      Returns 0 on failure.
      *      View function; callable by anyone.
      * @param user The user whose escrow to query.
