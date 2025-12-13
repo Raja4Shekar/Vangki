@@ -3,6 +3,7 @@
 pragma solidity ^0.8.29;
 
 import {LibDiamond} from "@diamond-3/libraries/LibDiamond.sol";
+import {FeedRegistryInterface} from "@chainlink/contracts/src/v0.8/interfaces/FeedRegistryInterface.sol";
 
 /**
  * @title LibVangki
@@ -25,6 +26,14 @@ library LibVangki {
     uint256 constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
     uint256 constant TREASURY_FEE_BPS = 100; // 1% of interest
     uint256 constant BASIS_POINTS = 10000;
+    uint256 constant KYC_THRESHOLD_USD = 2000 * 1e18; // Scaled to 1e18
+    uint256 constant HF_SCALE = 1e18; // Health Factor precision
+    uint256 constant HF_LIQUIDATION_THRESHOLD = 1e18; // HF < 1 for liquidation
+    uint256 constant SECONDS_PER_YEAR = 365 days;
+    uint256 constant ONE_DAY = 1 days;
+    uint256 constant MIN_LIQUIDITY_USD = 1_000_000 * 1e6; // $1M with 6 decimals (for USDT)
+    uint256 constant LTV_SCALE = 10000; // Basis points (e.g., 7500 = 75%)
+    uint256 constant RENTAL_BUFFER_BPS = 500; // 5% buffer for NFT rentals
 
     error CrossFacetCallFailed(string reason);
 
@@ -144,6 +153,10 @@ library LibVangki {
         address vangkiEscrowTemplate; // Shared UUPS implementation
         address treasury; // Configurable treasury address
         address zeroExProxy; // 0x proxy for liquidations
+        address usdChainlinkDenominator; // Chainlink USD Denominator
+        address chainlnkRegistry; // Chainlink Registry
+        address usdtContract; // USDT Contract address
+        address uniswapV3Factory; // UNISWAP_V3_FACTORY
         mapping(uint256 => uint256) loanToSaleOfferId;
         mapping(uint256 => Offer) offers;
         mapping(uint256 => Loan) loans;
@@ -252,5 +265,35 @@ library LibVangki {
         LibDiamond.enforceIsContractOwner();
         Storage storage s = storageSlot();
         s.zeroExProxy = newProxy;
+    }
+
+    /// @dev set Chainlink USD Denominator
+    function setUsdChainlinkDenominator(
+        address newUsdChainlinkDenominator
+    ) internal {
+        LibDiamond.enforceIsContractOwner();
+        Storage storage s = storageSlot();
+        s.usdChainlinkDenominator = newUsdChainlinkDenominator;
+    }
+
+    /// @dev set Chainlink Registry
+    function setChainlinkRegistry(address newChainlnkRegistry) internal {
+        LibDiamond.enforceIsContractOwner();
+        Storage storage s = storageSlot();
+        s.chainlnkRegistry = newChainlnkRegistry;
+    }
+
+    /// @dev set USDT Contract Address
+    function setUsdtContract(address newUsdtContract) internal {
+        LibDiamond.enforceIsContractOwner();
+        Storage storage s = storageSlot();
+        s.usdtContract = newUsdtContract;
+    }
+
+    /// @dev set Uniswap V3 Factory address for the chain
+    function setUniswapV3Factory(address newUniswapV3Factory) internal {
+        LibDiamond.enforceIsContractOwner();
+        Storage storage s = storageSlot();
+        s.uniswapV3Factory = newUniswapV3Factory;
     }
 }

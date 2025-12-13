@@ -72,17 +72,6 @@ contract RepayFacet is ReentrancyGuard {
     error HealthFactorTooLow();
     error NotNFTRental();
 
-    // Constants
-    uint256 private constant BASIS_POINTS = 10000;
-    uint256 private constant TREASURY_FEE_BPS = 100; // 1%
-    uint256 private constant SECONDS_PER_YEAR = 365 days;
-    uint256 private constant ONE_DAY = 1 days;
-    uint256 private constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
-
-    // Assume treasury (hardcoded; move to LibVangki)
-    // address private immutable TREASURY =
-    //     address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
-
     /**
      * @notice Repays an active loan in full.
      * @dev Caller must approve totalDue (from calculateRepaymentAmount).
@@ -102,7 +91,9 @@ contract RepayFacet is ReentrancyGuard {
         if (loan.status != LibVangki.LoanStatus.Active)
             revert InvalidLoanStatus();
 
-        uint256 endTime = loan.startTime + loan.durationDays * ONE_DAY;
+        uint256 endTime = loan.startTime +
+            loan.durationDays *
+            LibVangki.ONE_DAY;
         uint256 graceEnd = endTime + LibVangki.gracePeriod(loan.durationDays);
         if (block.timestamp > graceEnd) revert RepaymentPastGracePeriod();
 
@@ -119,19 +110,19 @@ contract RepayFacet is ReentrancyGuard {
                     (loan.principal *
                         loan.interestRateBps *
                         loan.durationDays) /
-                    (SECONDS_PER_YEAR * BASIS_POINTS);
+                    (LibVangki.SECONDS_PER_YEAR * LibVangki.BASIS_POINTS);
             } else {
                 uint256 elapsed = block.timestamp - loan.startTime;
                 interest =
                     (loan.principal *
                         loan.interestRateBps *
-                        (elapsed / ONE_DAY)) /
-                    (SECONDS_PER_YEAR * BASIS_POINTS);
+                        (elapsed / LibVangki.ONE_DAY)) /
+                    (LibVangki.SECONDS_PER_YEAR * LibVangki.BASIS_POINTS);
             }
 
             uint256 totalInterest = interest + lateFee;
-            uint256 treasuryShare = (totalInterest * TREASURY_FEE_BPS) /
-                BASIS_POINTS;
+            uint256 treasuryShare = (totalInterest *
+                LibVangki.TREASURY_FEE_BPS) / LibVangki.BASIS_POINTS;
             uint256 lenderShare = totalInterest - treasuryShare;
 
             // Transfer from borrower
@@ -162,7 +153,8 @@ contract RepayFacet is ReentrancyGuard {
             // NFT rental: Deduct full accrued from prepay
             if (loan.prepayAmount == 0) revert InsufficientPrepay();
 
-            uint256 elapsedDays = (block.timestamp - loan.startTime) / ONE_DAY;
+            uint256 elapsedDays = (block.timestamp - loan.startTime) /
+                LibVangki.ONE_DAY;
             if (loan.useFullTermInterest) {
                 interest = loan.principal * loan.durationDays;
             } else {
@@ -172,8 +164,8 @@ contract RepayFacet is ReentrancyGuard {
             uint256 totalDue = interest + lateFee;
             if (totalDue > loan.prepayAmount) revert InsufficientPrepay();
 
-            uint256 treasuryShare = (totalDue * TREASURY_FEE_BPS) /
-                BASIS_POINTS;
+            uint256 treasuryShare = (totalDue * LibVangki.TREASURY_FEE_BPS) /
+                LibVangki.BASIS_POINTS;
             uint256 lenderShare = totalDue - treasuryShare;
 
             // Deduct from prepay in borrower escrow
@@ -253,7 +245,7 @@ contract RepayFacet is ReentrancyGuard {
         );
         if (!success) revert CrossFacetCallFailed("HF check failed");
         uint256 hf = abi.decode(result, (uint256));
-        if (hf < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+        if (hf < LibVangki.MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
 
         // Common: Update NFTs and status
         (success, ) = address(this).call(
@@ -309,10 +301,12 @@ contract RepayFacet is ReentrancyGuard {
         if (partialAmount == 0) revert InsufficientPartialAmount();
         uint256 minPartial = (loan.principal *
             s.assetRiskParams[loan.principalAsset].minPartialBps) /
-            BASIS_POINTS;
+            LibVangki.BASIS_POINTS;
         if (partialAmount < minPartial) revert InsufficientPartialAmount();
 
-        uint256 endTime = loan.startTime + loan.durationDays * ONE_DAY;
+        uint256 endTime = loan.startTime +
+            loan.durationDays *
+            LibVangki.ONE_DAY;
         uint256 graceEnd = endTime + LibVangki.gracePeriod(loan.durationDays);
         if (block.timestamp > graceEnd) revert RepaymentPastGracePeriod();
         address treasury = _getTreasury();
@@ -324,10 +318,13 @@ contract RepayFacet is ReentrancyGuard {
             // ERC20: Accrued to now + partial principal
             uint256 elapsed = block.timestamp - loan.startTime;
             accrued =
-                (loan.principal * loan.interestRateBps * (elapsed / ONE_DAY)) /
-                (SECONDS_PER_YEAR * BASIS_POINTS);
+                (loan.principal *
+                    loan.interestRateBps *
+                    (elapsed / LibVangki.ONE_DAY)) /
+                (LibVangki.SECONDS_PER_YEAR * LibVangki.BASIS_POINTS);
 
-            uint256 treasuryShare = (accrued * TREASURY_FEE_BPS) / BASIS_POINTS;
+            uint256 treasuryShare = (accrued * LibVangki.TREASURY_FEE_BPS) /
+                LibVangki.BASIS_POINTS;
             uint256 lenderShare = accrued - treasuryShare;
 
             if (partialAmount > loan.principal)
@@ -360,7 +357,8 @@ contract RepayFacet is ReentrancyGuard {
 
             if (accrued > loan.prepayAmount) revert InsufficientPrepay();
 
-            uint256 treasuryShare = (accrued * TREASURY_FEE_BPS) / BASIS_POINTS;
+            uint256 treasuryShare = (accrued * LibVangki.TREASURY_FEE_BPS) /
+                LibVangki.BASIS_POINTS;
             uint256 lenderShare = accrued - treasuryShare;
 
             // Deduct from prepay
@@ -393,7 +391,7 @@ contract RepayFacet is ReentrancyGuard {
 
             // Update renter expires if reduced
             uint64 newExpires = uint64(
-                loan.startTime + loan.durationDays * ONE_DAY
+                loan.startTime + loan.durationDays * LibVangki.ONE_DAY
             );
             (success, ) = address(this).call(
                 abi.encodeWithSelector(
@@ -419,7 +417,7 @@ contract RepayFacet is ReentrancyGuard {
         );
         if (!success) revert CrossFacetCallFailed("HF check failed");
         uint256 hf = abi.decode(result, (uint256));
-        if (hf < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+        if (hf < LibVangki.MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
     }
 
     /**
@@ -440,13 +438,14 @@ contract RepayFacet is ReentrancyGuard {
             revert InvalidLoanStatus();
         if (loan.assetType == LibVangki.AssetType.ERC20) revert NotNFTRental();
 
-        if (block.timestamp < loan.lastDeductTime + ONE_DAY)
+        if (block.timestamp < loan.lastDeductTime + LibVangki.ONE_DAY)
             revert NotDailyYet();
 
         uint256 dayFee = loan.principal; // Daily rental fee
         if (dayFee > loan.prepayAmount) revert InsufficientPrepay();
 
-        uint256 treasuryShare = (dayFee * TREASURY_FEE_BPS) / BASIS_POINTS;
+        uint256 treasuryShare = (dayFee * LibVangki.TREASURY_FEE_BPS) /
+            LibVangki.BASIS_POINTS;
         uint256 lenderShare = dayFee - treasuryShare;
         address treasury = _getTreasury();
 
@@ -476,12 +475,12 @@ contract RepayFacet is ReentrancyGuard {
         unchecked {
             loan.prepayAmount -= dayFee;
             loan.durationDays -= 1;
-            loan.lastDeductTime += ONE_DAY;
+            loan.lastDeductTime += LibVangki.ONE_DAY;
         }
 
         // Update renter expires
         uint64 newExpires = uint64(
-            loan.startTime + loan.durationDays * ONE_DAY
+            loan.startTime + loan.durationDays * LibVangki.ONE_DAY
         );
         (success, ) = address(this).call(
             abi.encodeWithSelector(
@@ -519,23 +518,25 @@ contract RepayFacet is ReentrancyGuard {
         LibVangki.Loan storage loan = s.loans[loanId];
         if (loan.status != LibVangki.LoanStatus.Active) return 0;
 
-        uint256 endTime = loan.startTime + loan.durationDays * ONE_DAY;
+        uint256 endTime = loan.startTime +
+            loan.durationDays *
+            LibVangki.ONE_DAY;
 
         // Interest/Rental based on per-loan flag
         uint256 interest;
         uint256 elapsed = block.timestamp - loan.startTime;
-        uint256 elapsedDays = elapsed / ONE_DAY;
+        uint256 elapsedDays = elapsed / LibVangki.ONE_DAY;
         if (loan.assetType == LibVangki.AssetType.ERC20) {
             if (loan.useFullTermInterest) {
                 interest =
                     (loan.principal *
                         loan.interestRateBps *
                         loan.durationDays) /
-                    (SECONDS_PER_YEAR * BASIS_POINTS);
+                    (LibVangki.SECONDS_PER_YEAR * LibVangki.BASIS_POINTS);
             } else {
                 interest =
                     (loan.principal * loan.interestRateBps * elapsedDays) /
-                    (SECONDS_PER_YEAR * BASIS_POINTS);
+                    (LibVangki.SECONDS_PER_YEAR * LibVangki.BASIS_POINTS);
             }
             totalDue = loan.principal + interest;
         } else {

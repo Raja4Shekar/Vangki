@@ -78,11 +78,6 @@ contract OfferFacet is ReentrancyGuard, Pausable {
     error CrossFacetCallFailed(string reason);
     error GetUserEscrowFailed(string reason);
 
-    // Constants
-    uint256 private constant KYC_THRESHOLD_USD = 2000 * 1e18; // $2k scaled to 1e18 for comparison
-    uint256 private constant RENTAL_BUFFER_BPS = 500; // 5% buffer for NFT rentals
-    uint256 private constant BASIS_POINTS = 10000;
-
     /**
      * @notice Creates a new offer (Lender or Borrower).
      * @dev Deposits/locks assets into user's escrow (via EscrowFactoryFacet).
@@ -254,7 +249,7 @@ contract OfferFacet is ReentrancyGuard, Pausable {
 
         // Calculate transaction value for KYC
         uint256 valueUSD = _calculateTransactionValueUSD(offer);
-        if (valueUSD > KYC_THRESHOLD_USD) {
+        if (valueUSD > LibVangki.KYC_THRESHOLD_USD) {
             if (
                 !ProfileFacet(address(this)).isKYCVerified(offer.creator) ||
                 !ProfileFacet(address(this)).isKYCVerified(msg.sender)
@@ -297,7 +292,8 @@ contract OfferFacet is ReentrancyGuard, Pausable {
         } else {
             // NFT renting: Borrower prepays (fee * days + 5% buffer)
             uint256 prepayAmount = offer.amount * offer.durationDays;
-            uint256 buffer = (prepayAmount * RENTAL_BUFFER_BPS) / BASIS_POINTS;
+            uint256 buffer = (prepayAmount * LibVangki.RENTAL_BUFFER_BPS) /
+                LibVangki.BASIS_POINTS;
             uint256 totalPrepay = prepayAmount + buffer;
             IERC20(offer.prepayAsset).safeTransferFrom(
                 borrower,
@@ -556,7 +552,7 @@ contract OfferFacet is ReentrancyGuard, Pausable {
             (10 ** collateralDecimals);
         if (collateralValueUSD == 0) return type(uint256).max; // Infinite LTV
 
-        return (borrowedValueUSD * BASIS_POINTS) / collateralValueUSD;
+        return (borrowedValueUSD * LibVangki.BASIS_POINTS) / collateralValueUSD;
     }
 
     // Internal helper for current borrow balance with accrued interest
@@ -566,7 +562,7 @@ contract OfferFacet is ReentrancyGuard, Pausable {
         uint256 elapsed = block.timestamp - loan.startTime;
         uint256 accruedInterest = (loan.principal *
             loan.interestRateBps *
-            (elapsed / 1 days)) / (365 * BASIS_POINTS);
+            (elapsed / 1 days)) / (365 * LibVangki.BASIS_POINTS);
         return loan.principal + accruedInterest;
     }
 

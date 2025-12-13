@@ -658,6 +658,7 @@ The Diamond Standard (EIP-2535) need to be followed for smart contract developem
 ## Security Note:
 
 - The offers from users will be listed to only those users who are in the respective countries that can trade between themselves. This is done as there can be sactions between the countries.
+  - For trading sanctions, we just can't have a status saying some country is sanctioned, we need to know, which countries have got sanctioned or whitelisted to that particular country. we can't single out a country saying that it got sanctioned and no other country can trade with it. so we need to have a many to many type of mapping to check whether we can show the offer or to allow the offer acceptance (or loan initiation).
 - No common escrow account and only seperate Escrow account for each users (via clone factory for gas efficiency) would implemented which will then be managed by Vangki App. This is to avoid commingling of funds.
 - Use Reentrancygaurd and pausable from Openzeppelin wherever needed.
 

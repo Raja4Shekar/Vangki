@@ -71,21 +71,6 @@ contract RiskFacet is ReentrancyGuard, Pausable {
     error CrossFacetCallFailed(string reason);
     error KYCRequired();
 
-    // Constants
-    uint256 private constant BASIS_POINTS = 10000; // For bps calculations
-    uint256 private constant SECONDS_PER_YEAR = 365 days; // For interest accrual
-    uint256 private constant HF_SCALE = 1e18; // Health Factor precision
-    uint256 private constant HF_LIQUIDATION_THRESHOLD = 1e18; // HF < 1 for liquidation
-    uint256 private constant KYC_THRESHOLD_USD = 2000 * 1e18; // $2k scaled
-
-    // // Immutable 0x proxy
-    // address private immutable ZERO_EX_PROXY =
-    //     0xDef1C0ded9bec7F1a1670819833240f027b25EfF;
-
-    // // Treasury (hardcoded; move to storage)
-    // address private immutable TREASURY =
-    //     address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA);
-
     /**
      * @notice Updates risk parameters for an asset.
      * @dev Callable only by Diamond owner (multi-sig/governance).
@@ -155,7 +140,7 @@ contract RiskFacet is ReentrancyGuard, Pausable {
             (10 ** collateralDecimals);
         if (collateralValueUSD == 0) revert ZeroCollateral();
 
-        ltv = (borrowedValueUSD * BASIS_POINTS) / collateralValueUSD;
+        ltv = (borrowedValueUSD * LibVangki.BASIS_POINTS) / collateralValueUSD;
     }
 
     /**
@@ -195,11 +180,13 @@ contract RiskFacet is ReentrancyGuard, Pausable {
             .assetRiskParams[loan.collateralAsset]
             .liqThresholdBps;
         uint256 riskAdjustedCollateral = (collateralValueUSD *
-            liqThresholdBps) / BASIS_POINTS;
+            liqThresholdBps) / LibVangki.BASIS_POINTS;
 
         if (borrowValueUSD == 0) return type(uint256).max; // Infinite HF if no borrow
 
-        healthFactor = (riskAdjustedCollateral * HF_SCALE) / borrowValueUSD;
+        healthFactor =
+            (riskAdjustedCollateral * LibVangki.HF_SCALE) /
+            borrowValueUSD;
     }
 
     /**
@@ -223,7 +210,8 @@ contract RiskFacet is ReentrancyGuard, Pausable {
 
         // Check HF < 1e18
         uint256 hf = this.calculateHealthFactor(loanId);
-        if (hf >= HF_LIQUIDATION_THRESHOLD) revert HealthFactorNotLow();
+        if (hf >= LibVangki.HF_LIQUIDATION_THRESHOLD)
+            revert HealthFactorNotLow();
 
         // Liquidity check (revert if non-liquid)
         LibVangki.LiquidityStatus liquidity = OracleFacet(address(this))
@@ -270,7 +258,7 @@ contract RiskFacet is ReentrancyGuard, Pausable {
         uint256 liqBonusBps = s
             .assetRiskParams[loan.collateralAsset]
             .liqBonusBps;
-        uint256 bonus = (proceeds * liqBonusBps) / BASIS_POINTS;
+        uint256 bonus = (proceeds * liqBonusBps) / LibVangki.BASIS_POINTS;
         IERC20(loan.principalAsset).safeTransfer(msg.sender, bonus);
 
         // Remainder to lender
@@ -281,7 +269,7 @@ contract RiskFacet is ReentrancyGuard, Pausable {
             .getAssetPrice(loan.principalAsset);
         uint256 bonusUSD = (bonus * price) / (10 ** decimals);
         if (
-            bonusUSD > KYC_THRESHOLD_USD &&
+            bonusUSD > LibVangki.KYC_THRESHOLD_USD &&
             !ProfileFacet(address(this)).isKYCVerified(msg.sender)
         ) revert KYCRequired();
 
@@ -324,7 +312,7 @@ contract RiskFacet is ReentrancyGuard, Pausable {
         uint256 elapsed = block.timestamp - loan.startTime;
         uint256 accruedInterest = (loan.principal *
             loan.interestRateBps *
-            elapsed) / (SECONDS_PER_YEAR * BASIS_POINTS);
+            elapsed) / (LibVangki.SECONDS_PER_YEAR * LibVangki.BASIS_POINTS);
         return loan.principal + accruedInterest;
     }
 

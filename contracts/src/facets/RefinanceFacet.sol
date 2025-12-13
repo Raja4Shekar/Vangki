@@ -53,15 +53,6 @@ contract RefinanceFacet is ReentrancyGuard {
     error LTVExceeded(); // New: Post-refinance LTV > max
     error CrossFacetCallFailed(string reason);
 
-    // Constants (configurable via governance in Phase 2)
-    uint256 private constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
-    uint256 private constant BASIS_POINTS = 10000;
-
-    // Assume treasury address (add to LibVangki.Storage as address treasury;)
-    // For now, hardcoded as immutable; make configurable.
-    address private immutable TREASURY =
-        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
-
     /**
      * @notice Allows borrower to refinance an active loan by accepting a new lender offer.
      * @dev Repays old loan (principal + pro-rata interest) using new principal from new offer.
@@ -109,10 +100,10 @@ contract RefinanceFacet is ReentrancyGuard {
         // Handle shortfall if new offer interest lower (full-term comparison)
         uint256 oldExpectedInterest = (oldLoan.principal *
             oldLoan.interestRateBps *
-            oldLoan.durationDays) / (365 * BASIS_POINTS);
+            oldLoan.durationDays) / (365 * LibVangki.BASIS_POINTS);
         uint256 newExpectedInterest = (newOffer.amount *
             newOffer.interestRateBps *
-            newOffer.durationDays) / (365 * BASIS_POINTS);
+            newOffer.durationDays) / (365 * LibVangki.BASIS_POINTS);
         uint256 shortfall = 0;
         if (newExpectedInterest < oldExpectedInterest) {
             shortfall = oldExpectedInterest - newExpectedInterest;
@@ -154,7 +145,7 @@ contract RefinanceFacet is ReentrancyGuard {
         );
         if (!success) revert CrossFacetCallFailed("HF calc failed");
         uint256 newHF = abi.decode(result, (uint256));
-        if (newHF < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+        if (newHF < LibVangki.MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
 
         // Check post-refinance LTV <= maxLtvBps
         (success, result) = address(this).staticcall(
@@ -202,6 +193,11 @@ contract RefinanceFacet is ReentrancyGuard {
         unchecked {
             s.treasuryBalances[asset] += amount;
         }
-        IERC20(asset).safeTransfer(TREASURY, amount);
+        IERC20(asset).safeTransfer(_getTreasury(), amount);
+    }
+
+    /// @dev Get Treasury Address
+    function _getTreasury() internal view returns (address) {
+        return LibVangki.storageSlot().treasury;
     }
 }

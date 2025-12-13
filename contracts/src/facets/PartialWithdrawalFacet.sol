@@ -49,11 +49,6 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
     error HealthFactorTooLow();
     error LTVExceeded(); // For post-withdrawal LTV > maxLtvBps
 
-    // Constants (configurable via governance in Phase 2; align with RiskFacet)
-    uint256 private constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
-    uint256 private constant HF_SCALE = 1e18;
-    uint256 private constant BASIS_POINTS = 10000;
-
     /**
      * @notice Allows borrower to withdraw partial collateral from an active loan.
      * @dev Checks liquidity (must be liquid), simulates post-HF >= min and post-LTV <= max, withdraws from escrow, updates loan.collateralAmount.
@@ -89,7 +84,8 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
         // Simulate post-withdrawal HF and LTV
         uint256 tempCollateral = loan.collateralAmount - amount;
         uint256 simulatedHF = _simulateHF(loan, tempCollateral);
-        if (simulatedHF < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+        if (simulatedHF < LibVangki.MIN_HEALTH_FACTOR)
+            revert HealthFactorTooLow();
 
         uint256 simulatedLTV = _simulateLTV(loan, tempCollateral);
         uint256 maxLtvBps = s.assetRiskParams[loan.collateralAsset].maxLtvBps;
@@ -166,7 +162,7 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
                 .assetRiskParams[loan.collateralAsset]
                 .maxLtvBps;
 
-            if (simHF >= MIN_HEALTH_FACTOR && simLTV <= maxLtvBps) {
+            if (simHF >= LibVangki.MIN_HEALTH_FACTOR && simLTV <= maxLtvBps) {
                 low = mid;
             } else {
                 high = mid - 1;
@@ -199,10 +195,10 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
             .assetRiskParams[loan.collateralAsset]
             .liqThresholdBps;
         uint256 riskAdjustedCollateral = (collateralValueUSD *
-            liqThresholdBps) / BASIS_POINTS;
+            liqThresholdBps) / LibVangki.BASIS_POINTS;
 
         if (borrowValueUSD == 0) return type(uint256).max;
-        return (riskAdjustedCollateral * HF_SCALE) / borrowValueUSD;
+        return (riskAdjustedCollateral * LibVangki.HF_SCALE) / borrowValueUSD;
     }
 
     /// @dev Simulates LTV with temp collateral (borrowUSD * 10000 / collateralUSD).
@@ -223,7 +219,7 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
             (10 ** collateralDecimals);
         if (collateralValueUSD == 0) return type(uint256).max; // Infinite LTV
 
-        return (borrowedValueUSD * BASIS_POINTS) / collateralValueUSD;
+        return (borrowedValueUSD * LibVangki.BASIS_POINTS) / collateralValueUSD;
     }
 
     // Internal helper for current borrow balance with accrued interest
@@ -233,7 +229,7 @@ contract PartialWithdrawalFacet is ReentrancyGuard {
         uint256 elapsed = block.timestamp - loan.startTime;
         uint256 accruedInterest = (loan.principal *
             loan.interestRateBps *
-            (elapsed / 1 days)) / (365 * BASIS_POINTS);
+            (elapsed / 1 days)) / (365 * LibVangki.BASIS_POINTS);
         return loan.principal + accruedInterest;
     }
 }

@@ -46,11 +46,6 @@ contract EarlyWithdrawalFacet is ReentrancyGuard {
     error RateShortfallTooHigh();
     error CrossFacetCallFailed(string reason);
 
-    // Assume treasury address (add to LibVangki.Storage as address treasury;)
-    // For now, hardcoded as immutable; make configurable.
-    address private immutable TREASURY =
-        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
-
     /**
      * @notice Allows original lender to sell an active loan by accepting a new Lender Offer.
      * @dev Option 1: Liam accepts Noah's Lender Offer. Transfers principal, forfeits accrued to treasury,
@@ -221,6 +216,11 @@ contract EarlyWithdrawalFacet is ReentrancyGuard {
         unchecked {
             s.treasuryBalances[asset] += amount;
         }
-        IERC20(asset).safeTransfer(TREASURY, amount);
+        IERC20(asset).safeTransfer(_getTreasury(), amount);
+    }
+
+    /// @dev Get Treasury Address
+    function _getTreasury() internal view returns (address) {
+        return LibVangki.storageSlot().treasury;
     }
 }

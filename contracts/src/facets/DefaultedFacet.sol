@@ -52,18 +52,6 @@ contract DefaultedFacet is ReentrancyGuard, Pausable {
     error LiquidationFailed();
     error KYCRequired();
 
-    // Immutable 0x ExchangeProxy (mainnet; make configurable in Phase 2 via storage)
-    // address private immutable ZERO_EX_PROXY =
-    //     0xDef1C0ded9bec7F1a1670819833240f027b25EfF;
-
-    // Assume treasury (hardcoded; move to LibVangki)
-    // address private immutable TREASURY =
-    //     address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
-
-    // Constants
-    uint256 private constant BASIS_POINTS = 10000;
-    uint256 private constant KYC_THRESHOLD_USD = 2000 * 1e18; // Scaled to 1e18
-
     /**
      * @notice Triggers default for a loan past grace period (permissionless).
      * @dev If liquid collateral: Calls triggerLiquidation (0x swap).

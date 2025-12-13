@@ -80,15 +80,6 @@ contract PrecloseFacet is ReentrancyGuard, Pausable {
     error InsufficientShortfallPayment();
     error MaturityNotReached(); // If early preclose restricted; not used in Phase 1
 
-    // Constants (configurable via governance in Phase 2)
-    uint256 private constant MIN_HEALTH_FACTOR = 150 * 1e16; // 1.5 scaled to 1e18
-    uint256 private constant TREASURY_FEE_BPS = 100; // 1% of interest
-    uint256 private constant BASIS_POINTS = 10000;
-
-    // Assume treasury address (add to LibVangki.Storage if not present; hardcoded for now)
-    address private immutable TREASURY =
-        address(0xb985F8987720C6d76f02909890AA21C11bC6EBCA); // Replace with actual
-
     /**
      * @notice Directly precloses an active loan (Option 1).
      * @dev Borrower pays principal + pro-rata interest. 99% to lender, 1% to treasury.
@@ -109,8 +100,9 @@ contract PrecloseFacet is ReentrancyGuard, Pausable {
         // Calculate pro-rata interest
         uint256 elapsed = block.timestamp - loan.startTime;
         uint256 interest = (loan.principal * loan.interestRateBps * elapsed) /
-            (365 days * BASIS_POINTS);
-        uint256 treasuryFee = (interest * TREASURY_FEE_BPS) / BASIS_POINTS;
+            (365 days * LibVangki.BASIS_POINTS);
+        uint256 treasuryFee = (interest * LibVangki.TREASURY_FEE_BPS) /
+            LibVangki.BASIS_POINTS;
         uint256 lenderInterest = interest - treasuryFee;
 
         // Transfer principal + interest from borrower
@@ -121,7 +113,7 @@ contract PrecloseFacet is ReentrancyGuard, Pausable {
         );
         IERC20(loan.principalAsset).safeTransferFrom(
             msg.sender,
-            TREASURY,
+            _getTreasury(),
             treasuryFee
         );
 
@@ -233,13 +225,13 @@ contract PrecloseFacet is ReentrancyGuard, Pausable {
         uint256 elapsed = block.timestamp - loan.startTime;
         uint256 accruedInterest = (loan.principal *
             loan.interestRateBps *
-            elapsed) / (365 days * BASIS_POINTS);
+            elapsed) / (365 days * LibVangki.BASIS_POINTS);
         uint256 originalExpectedRemaining = (loan.principal *
             loan.interestRateBps *
-            remainingDays) / (365 * BASIS_POINTS);
+            remainingDays) / (365 * LibVangki.BASIS_POINTS);
         uint256 newExpected = (loan.principal *
             loan.interestRateBps *
-            newDurationDays) / (365 * BASIS_POINTS); // Assume same rate; adjust if variable
+            newDurationDays) / (365 * LibVangki.BASIS_POINTS); // Assume same rate; adjust if variable
         uint256 shortfall = accruedInterest +
             (
                 originalExpectedRemaining > newExpected
@@ -299,7 +291,7 @@ contract PrecloseFacet is ReentrancyGuard, Pausable {
         );
         if (!success) revert CrossFacetCallFailed("HF check failed");
         uint256 newHF = abi.decode(result, (uint256));
-        if (newHF < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+        if (newHF < LibVangki.MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
 
         // Update NFTs: Close old borrower NFT, mint new for Ben
         (success, ) = address(this).call(
@@ -397,10 +389,10 @@ contract PrecloseFacet is ReentrancyGuard, Pausable {
         // Calculate and pay shortfall (original expected vs. new)
         uint256 originalExpected = (loan.principal *
             loan.interestRateBps *
-            remainingDays) / (365 * BASIS_POINTS);
+            remainingDays) / (365 * LibVangki.BASIS_POINTS);
         uint256 newExpected = (loan.principal *
             interestRateBps *
-            durationDays) / (365 * BASIS_POINTS);
+            durationDays) / (365 * LibVangki.BASIS_POINTS);
         uint256 shortfall = originalExpected > newExpected
             ? originalExpected - newExpected
             : 0;
@@ -425,7 +417,7 @@ contract PrecloseFacet is ReentrancyGuard, Pausable {
         );
         if (!success) revert CrossFacetCallFailed("HF check failed");
         uint256 newHF = abi.decode(result, (uint256));
-        if (newHF < MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
+        if (newHF < LibVangki.MIN_HEALTH_FACTOR) revert HealthFactorTooLow();
 
         // Release collateral
         (success, ) = address(this).call(
@@ -459,5 +451,10 @@ contract PrecloseFacet is ReentrancyGuard, Pausable {
             address(0), // New borrower placeholder
             shortfall
         );
+    }
+
+    /// @dev Get Treasury Address
+    function _getTreasury() internal view returns (address) {
+        return LibVangki.storageSlot().treasury;
     }
 }

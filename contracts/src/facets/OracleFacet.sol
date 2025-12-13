@@ -40,19 +40,6 @@ contract OracleFacet {
     error InsufficientLiquidity();
     error NonLiquidAsset();
 
-    // Immutable network-specific configs (Ethereum mainnet examples; adjust for Polygon/Arbitrum)
-    address private immutable UNISWAP_V3_FACTORY =
-        0x1F98431c8aD98523631AE4a59f267346ea31F984;
-    address private immutable USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-    FeedRegistryInterface private immutable CHAINLINK_REGISTRY =
-        FeedRegistryInterface(0x47Fb2585D2C56Fe188D0E6ec628a38b74fCeeeDf);
-    address private immutable USD =
-        address(0x0000000000000000000000000000000000000348); // Chainlink USD denominator
-
-    // Constants
-    uint256 private constant MIN_LIQUIDITY_USD = 1_000_000 * 1e6; // $1M with 6 decimals (for USDT)
-    uint256 private constant LTV_SCALE = 10000; // Basis points (e.g., 7500 = 75%)
-
     /**
      * @notice Manually updates the liquidity status of an ERC20 asset in the mapping.
      * @dev Used for high-value assets or overrides; callable only by Diamond owner (multi-sig/governance).
@@ -84,7 +71,7 @@ contract OracleFacet {
     function checkLiquidity(
         address asset
     ) external view returns (LibVangki.LiquidityStatus) {
-        if (asset == address(0) || asset == USDT) {
+        if (asset == address(0) || asset == _getUsdtContract()) {
             // USDT as base, skip or handle specially
             revert InvalidAsset();
         }
@@ -97,7 +84,10 @@ contract OracleFacet {
 
         // Chainlink price feed check via registry (asset vs USD)
         AggregatorV3Interface feed = AggregatorV3Interface(
-            CHAINLINK_REGISTRY.getFeed(asset, USD)
+            FeedRegistryInterface(_getChainlnkRegistry()).getFeed(
+                asset,
+                _getUsdChainlinkDenominator()
+            )
         );
         if (address(feed) == address(0)) {
             return LibVangki.LiquidityStatus.Illiquid;
@@ -120,8 +110,12 @@ contract OracleFacet {
         uint256 assetPrice = uint256(answer); // Assume 8 decimals; use feed.decimals() for precision
 
         // Uniswap v3 pool check for asset-USDT pair (0.3% fee)
-        address token0 = asset < USDT ? asset : USDT;
-        address token1 = asset < USDT ? USDT : asset;
+        address token0 = asset < _getUsdtContract()
+            ? asset
+            : _getUsdtContract();
+        address token1 = asset < _getUsdtContract()
+            ? _getUsdtContract()
+            : asset;
         uint24 fee = 3000; // 0.3%
         address pool = address(
             uint160(
@@ -129,7 +123,7 @@ contract OracleFacet {
                     keccak256(
                         abi.encodePacked(
                             hex"ff",
-                            UNISWAP_V3_FACTORY,
+                            _getUniswapV3Factory(),
                             keccak256(abi.encode(token0, token1, fee)),
                             hex"96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f" // Uniswap v3 init code hash
                         )
@@ -166,7 +160,7 @@ contract OracleFacet {
         uint8 decimals = feed.decimals();
         uint256 approxUsdLiquidity = (uint256(poolLiquidity) * assetPrice) /
             (10 ** decimals);
-        if (approxUsdLiquidity < MIN_LIQUIDITY_USD) {
+        if (approxUsdLiquidity < LibVangki.MIN_LIQUIDITY_USD) {
             return LibVangki.LiquidityStatus.Illiquid;
         }
 
@@ -205,7 +199,10 @@ contract OracleFacet {
 
         // Get borrowed value in USD
         AggregatorV3Interface borrowedFeed = AggregatorV3Interface(
-            CHAINLINK_REGISTRY.getFeed(borrowedAsset, USD)
+            FeedRegistryInterface(_getChainlnkRegistry()).getFeed(
+                borrowedAsset,
+                _getUsdChainlinkDenominator()
+            )
         );
         if (address(borrowedFeed) == address(0)) {
             revert NoPriceFeed();
@@ -219,7 +216,10 @@ contract OracleFacet {
 
         // Get collateral value in USD
         AggregatorV3Interface collateralFeed = AggregatorV3Interface(
-            CHAINLINK_REGISTRY.getFeed(collateralAsset, USD)
+            FeedRegistryInterface(_getChainlnkRegistry()).getFeed(
+                collateralAsset,
+                _getUsdChainlinkDenominator()
+            )
         );
         if (address(collateralFeed) == address(0)) {
             revert NoPriceFeed();
@@ -232,7 +232,7 @@ contract OracleFacet {
             uint256(collateralPrice)) / (10 ** collateralFeed.decimals());
 
         // Calculate LTV in basis points
-        ltv = (borrowedValueUSD * LTV_SCALE) / collateralValueUSD;
+        ltv = (borrowedValueUSD * LibVangki.LTV_SCALE) / collateralValueUSD;
     }
 
     /**
@@ -248,7 +248,10 @@ contract OracleFacet {
         address asset
     ) external view returns (uint256 price, uint8 decimals) {
         AggregatorV3Interface feed = AggregatorV3Interface(
-            CHAINLINK_REGISTRY.getFeed(asset, USD)
+            FeedRegistryInterface(_getChainlnkRegistry()).getFeed(
+                asset,
+                _getUsdChainlinkDenominator()
+            )
         );
         if (address(feed) == address(0)) {
             revert NoPriceFeed();
@@ -263,5 +266,25 @@ contract OracleFacet {
         }
         price = uint256(answer);
         decimals = feed.decimals();
+    }
+
+    /// @dev Get USD Chainlink Denominator
+    function _getUsdChainlinkDenominator() internal view returns (address) {
+        return LibVangki.storageSlot().usdChainlinkDenominator;
+    }
+
+    /// @dev Get Chainlnk Registry
+    function _getChainlnkRegistry() internal view returns (address) {
+        return LibVangki.storageSlot().chainlnkRegistry;
+    }
+
+    /// @dev Get USDT Contract Address
+    function _getUsdtContract() internal view returns (address) {
+        return LibVangki.storageSlot().usdtContract;
+    }
+
+    /// @dev Get Uniswap V3 Factory Address
+    function _getUniswapV3Factory() internal view returns (address) {
+        return LibVangki.storageSlot().uniswapV3Factory;
     }
 }
